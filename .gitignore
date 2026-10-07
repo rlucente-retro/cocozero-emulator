@@ -3,3 +3,9 @@ target/
 *.bmp
 tests/*.bmp
 .DS_Store
+
+# User-supplied ROMs and disk images
+*.rom
+*.dsk
+coco/roms/*.rom
+coco/dsk/*.dsk

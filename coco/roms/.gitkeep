@@ -1,0 +1,8 @@
+# Place required Tandy Color Computer ROM files here:
+#
+# - bas12.rom    : Tandy Color BASIC 1.2 (8192 bytes, required to boot)
+# - extbas11.rom : Extended Color BASIC 1.1 (8192 bytes, optional)
+# - disk11.rom   : Disk Extended Color BASIC 1.1 (8192 bytes, optional)
+#
+# NOTE: System ROM files are copyrighted and proprietary.
+# They are not distributed with this repository and must be supplied by the user.

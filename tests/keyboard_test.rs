@@ -6,6 +6,11 @@ use std::path::Path;
 
 #[test]
 fn test_type_command_in_basic() {
+    if !Path::new("coco/roms/bas12.rom").exists() {
+        eprintln!("Skipping test_type_command_in_basic: coco/roms/bas12.rom not present (user-supplied ROM required)");
+        return;
+    }
+
     let sd_path = Path::new("coco");
     let sd_bytes = build_virtual_fat32(sd_path).expect("Failed to build virtual FAT32");
     let storage = Box::new(MemoryStorage::from_bytes(sd_bytes));

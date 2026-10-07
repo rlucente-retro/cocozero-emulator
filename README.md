@@ -55,12 +55,11 @@ The emulator dynamically packages the `./coco/` host directory into a virtual FA
 
 ```text
 coco/
-├── roms/           # Color BASIC system ROMs (pre-installed)
+├── roms/           # Color BASIC system ROMs (user-supplied)
 │   ├── bas12.rom       # Color BASIC 1.2 (required)
-│   ├── extbas11.rom    # Extended Color BASIC 1.1
-│   └── disk11.rom      # Disk BASIC 1.1
+│   ├── extbas11.rom    # Extended Color BASIC 1.1 (optional)
+│   └── disk11.rom      # Disk BASIC 1.1 (optional)
 ├── dsk/            # Floppy disk images (.dsk) -> mount via F12
-│   └── zork1.dsk       # Pre-installed sample disk image
 ├── cart/           # ROM cartridges (.ccc / .rom) -> mount via F10
 ├── bin/            # Machine language binaries (.bin) -> load via F9 or LOADM
 ├── shots/          # Destination folder for captured screenshots (.png)
@@ -68,7 +67,13 @@ coco/
 └── autorun.txt     # Optional boot script (auto-executed at startup)
 ```
 
-- **Disks (`coco/dsk/`):** Place `.dsk` floppy images here. Press **F12** in the emulator to open the disk mount menu.
+> **Important Note on System ROMs:**
+> Due to copyright restrictions, proprietary Color Computer ROM files are **not distributed** with this repository. You must provide your own ROM files in `coco/roms/` before starting the emulator:
+> - `bas12.rom`: Tandy Color BASIC 1.2 (8192 bytes, required)
+> - `extbas11.rom`: Extended Color BASIC 1.1 (8192 bytes, optional)
+> - `disk11.rom`: Disk Extended Color BASIC 1.1 (8192 bytes, optional)
+
+- **Disks (`coco/dsk/`):** Place your `.dsk` floppy images here. Press **F12** in the emulator to open the disk mount menu.
 - **Cartridges (`coco/cart/`):** Place `.ccc` cartridge images here. Press **F10** to open the cartridge selector.
 - **Programs (`coco/bin/`):** Place executable `.bin` files here. Press **F9** or use the BASIC `LOADM` command to run them.
 
