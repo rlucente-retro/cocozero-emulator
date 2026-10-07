@@ -1,0 +1,5 @@
+target/
+**/target/
+*.bmp
+tests/*.bmp
+.DS_Store

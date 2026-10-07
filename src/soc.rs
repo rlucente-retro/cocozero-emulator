@@ -1,0 +1,211 @@
+//! CoCo Zero RP2350B System-on-a-Chip Emulator Engine.
+//!
+//! Ties together:
+//! - Dual ARM Cortex-M33 cores (252 MHz sys_clk)
+//! - Hardware TMDS encoder in SIO
+//! - SPI1 MicroSD card controller with software CS on GPIO 43
+//! - UART0 serial console telemetry
+//! - 520 KB SRAM with 320×240 RGB565 Framebuffer extraction
+
+use std::collections::VecDeque;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+
+use rp2350_emu::{Config, Emulator, EmulatorBuilder};
+
+use crate::keyboard::KeyboardMatrix;
+use crate::spi_sd::{SectorStorage, SpiSdCard};
+use crate::uf2::FlashImage;
+
+pub const SYS_CLK_HZ: u32 = 252_000_000;
+pub const FB_WIDTH: usize = 320;
+pub const FB_HEIGHT: usize = 240;
+pub const FB_PIXELS: usize = FB_WIDTH * FB_HEIGHT;
+
+pub struct CoCoZeroSoC {
+    pub emu: Emulator,
+    pub sd_card: Arc<Mutex<SpiSdCard>>,
+    pub serial_tx_log: Arc<Mutex<Vec<u8>>>,
+    pub serial_rx_queue: VecDeque<u8>,
+    pub fb_addr: Option<u32>,
+    pub frame_counter: u64,
+    pub keyboard: KeyboardMatrix,
+}
+
+impl CoCoZeroSoC {
+    pub fn new(sd_storage: Box<dyn SectorStorage + Send>) -> Result<Self, String> {
+        let config = Config {
+            sys_clk_hz: SYS_CLK_HZ,
+        };
+        let mut emu = EmulatorBuilder::new(config)
+            .build()
+            .map_err(|e| format!("Failed to build RP2350 emulator: {:?}", e))?;
+
+        let sd_card = Arc::new(Mutex::new(SpiSdCard::new(sd_storage)));
+        let serial_tx_log = Arc::new(Mutex::new(Vec::new()));
+
+        // Wire SPI1 to SD card
+        let sd_clone = Arc::clone(&sd_card);
+        emu.bus.spi[1].slave_handler = Some(Box::new(move |mosi| {
+            let mut card = sd_clone.lock().unwrap();
+            card.transfer_byte(mosi)
+        }));
+
+        // Wire UART0 TX to serial telemetry log + stdout
+        let tx_clone = Arc::clone(&serial_tx_log);
+        emu.bus.uart[0].tx_sink = Some(Box::new(move |byte| {
+            tx_clone.lock().unwrap().push(byte);
+            print!("{}", byte as char);
+            let _ = std::io::stdout().flush();
+        }));
+
+        Ok(Self {
+            emu,
+            sd_card,
+            serial_tx_log,
+            serial_rx_queue: VecDeque::new(),
+            fb_addr: Some(0x2002_2744),
+            frame_counter: 0,
+            keyboard: KeyboardMatrix::new(),
+        })
+    }
+
+    /// Load Flash memory image (from UF2 or raw binary) into XIP Flash space.
+    pub fn load_firmware(&mut self, flash: &FlashImage) {
+        self.emu.load_flash(&flash.memory);
+
+        // If bootrom is not loaded, initialize core 0 registers directly from flash vector table
+        if let (Some(sp), Some(pc)) = (flash.initial_sp, flash.entry_point) {
+            println!("Initializing Core 0 vectors directly: SP=0x{:08X}, PC=0x{:08X}", sp, pc);
+            self.emu.core_mut(0).regs.msp = sp;
+            self.emu.core_mut(0).regs.r[13] = sp;
+            self.emu.core_mut(0).regs.set_pc(pc & !1);
+            self.emu.core_mut(0).regs.xpsr = 1 << 24; // Thumb mode
+            // Core 1 waits in WFE until awakened by multicore launch handshake
+            self.emu.bus.atomics.set_wfe_waiting(1);
+
+            // When Core 0 bypasses Boot ROM directly into Flash, Boot ROM's
+            // security initialization (which sets RCP salt on both cores)
+            // was skipped. Initialize RCP salt so Core 1's Boot ROM monitor
+            // validates the canary check upon waking and handles the launch handshake.
+            self.emu.bus.atomics.rcp_salt_set(0, 0xCAFE_BABE);
+            self.emu.bus.atomics.rcp_salt_set(1, 0xDEAD_BEEF);
+        }
+    }
+
+    /// Load RP2350 Boot ROM binary into 0x00000000..0x00007FFF.
+    pub fn load_bootrom(&mut self, bootrom_bytes: &[u8]) {
+        self.emu.load_bootrom(bootrom_bytes);
+        self.emu.reset();
+    }
+
+    /// Update MicroSD Chip Select from SIO GPIO 43.
+    fn update_sd_cs(&mut self) {
+        let gpio_hi = self.emu.bus.sio.gpio_hi_out;
+        // GPIO 43 is bit 11 in GPIO_HI_OUT (active low)
+        let cs_asserted = (gpio_hi & (1 << (43 - 32))) == 0;
+        self.sd_card.lock().unwrap().set_cs(cs_asserted);
+    }
+
+    /// Inject a character into UART0 serial console and keyboard matrix.
+    pub fn push_serial_char(&mut self, ch: u8) {
+        self.emu.bus.uart[0].push_rx_byte(ch);
+        self.keyboard.type_char(ch as char);
+    }
+
+    /// Type an ASCII character into the Color Computer keyboard matrix.
+    pub fn type_char(&mut self, ch: char) {
+        self.keyboard.type_char(ch);
+    }
+
+    /// Type a string into the Color Computer keyboard matrix.
+    pub fn type_str(&mut self, s: &str) {
+        self.keyboard.type_str(s);
+    }
+
+    /// Press a physical key on the keyboard matrix.
+    pub fn key_down(&mut self, key: sdl2::keyboard::Keycode) {
+        self.keyboard.key_down(key);
+    }
+
+    /// Release a physical key on the keyboard matrix.
+    pub fn key_up(&mut self, key: sdl2::keyboard::Keycode) {
+        self.keyboard.key_up(key);
+    }
+
+    /// Advance the SoC simulation by virtual cycles.
+    pub fn step_cycles(&mut self, cycles: u64) -> Result<(), String> {
+        self.update_sd_cs();
+
+        // Feed any pending serial input
+        if let Some(ch) = self.serial_rx_queue.pop_front() {
+            self.emu.bus.uart[0].push_rx_byte(ch);
+        }
+
+        self.emu
+            .run(cycles)
+            .map_err(|e| format!("Emulator run error: {:?}", e))?;
+
+        self.update_sd_cs();
+        Ok(())
+    }
+
+    /// Step by one frame quantum (~252 MHz / 60 Hz = 4,200,000 cycles).
+    pub fn step_frame(&mut self) -> Result<(), String> {
+        self.step_frame_turbo(1)
+    }
+
+    /// Step by one frame quantum divided by turbo factor.
+    pub fn step_frame_turbo(&mut self, turbo: u32) -> Result<(), String> {
+        self.keyboard.sync_frame(&mut self.emu.bus);
+        let t = turbo.max(1) as u64;
+        let cycles_per_frame = ((SYS_CLK_HZ / 60) as u64) / t;
+        self.step_cycles(cycles_per_frame)?;
+        self.frame_counter += 1;
+        Ok(())
+    }
+
+    /// Scan SRAM to discover the active 320×240 RGB565 framebuffer.
+    pub fn detect_framebuffer(&mut self) -> Option<u32> {
+        if let Some(addr) = self.fb_addr {
+            return Some(addr);
+        }
+
+        // Look through SRAM (0x20000000..0x20080000) in 4KB steps
+        // Look for regions with non-zero color data
+        let sram_base = 0x2000_0000u32;
+        let sram_size = 520 * 1024;
+        let fb_byte_size = (FB_PIXELS * 2) as u32;
+
+        for offset in (0..(sram_size - fb_byte_size)).step_by(1024) {
+            let addr = sram_base + offset;
+            let mut nonzero_count = 0;
+            for i in 0..100 {
+                let pixel = self.emu.bus.memory.sram_read16(offset + i * 2);
+                if pixel != 0 {
+                    nonzero_count += 1;
+                }
+            }
+            if nonzero_count > 20 {
+                println!("Detected active framebuffer at SRAM 0x{:08X}", addr);
+                self.fb_addr = Some(addr);
+                return Some(addr);
+            }
+        }
+
+        None
+    }
+
+    /// Extract the 320×240 RGB565 frame from SRAM for rendering.
+    pub fn extract_frame(&mut self, out: &mut [u16; FB_PIXELS]) -> bool {
+        let addr = self.fb_addr.unwrap_or(0x2002_2744);
+        let offset = addr.saturating_sub(0x2000_0000);
+        let mem = &self.emu.bus.memory;
+        for i in 0..(FB_PIXELS / 2) {
+            let val = mem.sram_read32(offset + (i as u32) * 4);
+            out[i * 2] = val as u16;
+            out[i * 2 + 1] = (val >> 16) as u16;
+        }
+        true
+    }
+}

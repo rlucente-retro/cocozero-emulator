@@ -1,0 +1,18 @@
+# CoCo Zero System Settings
+sn76489           = on        # Enable SN76489 sound chip at $FF41
+volume            = 10        # Global audio volume (0-15)
+artifact_colors   = on        # PMODE 4 NTSC color artifacts (on / off / swapped)
+gime_palette      = on        # CoCo 3 palette registers at $FFB0-$FFBF
+gime_timer        = on        # CoCo 3 timer/interrupts at $FF90-$FF95
+autorun           = on        # Automatically run disk or autorun.txt on boot
+reset_button      = basic     # RUN button action: 'basic' (prompt) or 'autorun'
+serial_keyboard   = on        # Accept serial keystrokes over USB-CDC
+joystick_swap     = off       # Swap left/right gamepad sticks
+font              = 6847t2    # Font set: classic / 6847t1 / 6847t2
+lowercase         = on        # True lowercase display
+key_repeat        = on        # Keyboard auto-repeat
+key_repeat_delay  = 500       # Repeat delay in milliseconds
+key_repeat_rate   = 10        # Repeats per second (1-12)
+video_encoder     = hardware  # TMDS encoder: hardware (SIO) / software
+dpad              = joystick  # Gamepad D-pad mode: joystick / arrows
+pad_start         = enter     # Gamepad button mapping

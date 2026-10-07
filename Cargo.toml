@@ -1,0 +1,19 @@
+[package]
+name = "cocozero-rp2350"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rp2350-emu = { path = "crates/rp2350-emu" }
+
+sdl2 = { version = "0.38", default-features = false, features = ["use-pkgconfig"] }
+
+clap = { version = "4.5", features = ["derive"] }
+byteorder = "1.5"
+crc = "3.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

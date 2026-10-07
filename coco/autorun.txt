@@ -1,0 +1,4 @@
+# CoCo Zero Autorun Script
+# Commands can be BASIC statements or directives like:
+# @CART <filename.ccc>
+# @DIRECT <filename.bin>
