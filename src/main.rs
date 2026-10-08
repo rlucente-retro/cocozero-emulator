@@ -42,7 +42,7 @@ struct Args {
     max_frames: u64,
 
     /// Simulation turbo factor (1 = 252 MHz, 2 = 2x speedup / 126 MHz virtual frame quantum, 4 = 4x speedup, etc.)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 2)]
     turbo: u32,
 
     /// Override framebuffer SRAM address (e.g. 0x20010000)
@@ -151,6 +151,26 @@ fn main() {
     let mut last_fps_time = Instant::now();
     let mut fps_counter = 0;
 
+    // Spawn background non-blocking stdin reader for terminal typing
+    let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<char>();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 1];
+        while stdin.read_exact(&mut buf).is_ok() {
+            let ch = buf[0] as char;
+            let mapped = match ch {
+                '\n' => '\r',
+                c => c,
+            };
+            if stdin_tx.send(mapped).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut basic_ready_announced = false;
+
     loop {
         // Poll frontend input events
         if !frontend.poll_events() {
@@ -166,8 +186,15 @@ fn main() {
             }
         }
 
-        // Forward typed characters into the CoCo Zero keyboard matrix
+        // Forward typed characters from window into the CoCo Zero keyboard matrix
         while let Some(ch) = frontend.typed_chars.pop_front() {
+            eprintln!("[Input] Forwarding window char to SoC: {:?}", ch);
+            soc.type_char(ch);
+        }
+
+        // Forward typed characters from terminal stdin
+        while let Ok(ch) = stdin_rx.try_recv() {
+            eprintln!("[Input] Forwarding terminal stdin char to SoC: {:?}", ch);
             soc.type_char(ch);
         }
 
@@ -180,6 +207,11 @@ fn main() {
         if let Err(e) = soc.step_frame_turbo(args.turbo) {
             eprintln!("\nSimulation error at frame {}: {}", frame_count, e);
             break;
+        }
+
+        if !basic_ready_announced && soc.is_keyboard_ready() {
+            basic_ready_announced = true;
+            println!("\n[System Ready] Color BASIC initialization complete! Ready for keyboard input.");
         }
 
         // Extract and render framebuffer

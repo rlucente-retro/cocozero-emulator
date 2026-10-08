@@ -29,6 +29,8 @@ pub struct CoCoZeroSoC {
     pub serial_rx_queue: VecDeque<u8>,
     pub fb_addr: Option<u32>,
     pub frame_counter: u64,
+    pub total_cycles: u64,
+    pub keyboard_ready_forced: bool,
     pub keyboard: KeyboardMatrix,
 }
 
@@ -38,6 +40,7 @@ impl CoCoZeroSoC {
             sys_clk_hz: SYS_CLK_HZ,
         };
         let mut emu = EmulatorBuilder::new(config)
+            .step_quantum(512)
             .build()
             .map_err(|e| format!("Failed to build RP2350 emulator: {:?}", e))?;
 
@@ -66,6 +69,8 @@ impl CoCoZeroSoC {
             serial_rx_queue: VecDeque::new(),
             fb_addr: Some(0x2002_2744),
             frame_counter: 0,
+            total_cycles: 0,
+            keyboard_ready_forced: false,
             keyboard: KeyboardMatrix::new(),
         })
     }
@@ -107,10 +112,9 @@ impl CoCoZeroSoC {
         self.sd_card.lock().unwrap().set_cs(cs_asserted);
     }
 
-    /// Inject a character into UART0 serial console and keyboard matrix.
+    /// Inject a character into UART0 serial console.
     pub fn push_serial_char(&mut self, ch: u8) {
         self.emu.bus.uart[0].push_rx_byte(ch);
-        self.keyboard.type_char(ch as char);
     }
 
     /// Type an ASCII character into the Color Computer keyboard matrix.
@@ -146,8 +150,14 @@ impl CoCoZeroSoC {
             .run(cycles)
             .map_err(|e| format!("Emulator run error: {:?}", e))?;
 
+        self.total_cycles += cycles;
         self.update_sd_cs();
         Ok(())
+    }
+
+    /// Check whether Color BASIC has completed boot and is ready for keyboard input.
+    pub fn is_keyboard_ready(&self) -> bool {
+        self.keyboard_ready_forced || self.total_cycles >= 630_000_000
     }
 
     /// Step by one frame quantum (~252 MHz / 60 Hz = 4,200,000 cycles).
@@ -157,7 +167,8 @@ impl CoCoZeroSoC {
 
     /// Step by one frame quantum divided by turbo factor.
     pub fn step_frame_turbo(&mut self, turbo: u32) -> Result<(), String> {
-        self.keyboard.sync_frame(&mut self.emu.bus);
+        let ready = self.is_keyboard_ready();
+        self.keyboard.sync_frame(&mut self.emu.bus, turbo, ready);
         let t = turbo.max(1) as u64;
         let cycles_per_frame = ((SYS_CLK_HZ / 60) as u64) / t;
         self.step_cycles(cycles_per_frame)?;

@@ -226,6 +226,21 @@ impl TimerRegs {
         // Deliberately empty — see doc comment.
     }
 
+    /// Returns the microsecond delta until the earliest armed and enabled alarm fires.
+    /// Returns `None` if no enabled alarms are armed.
+    pub fn next_alarm_delta_us(&self) -> Option<u64> {
+        let mut min_delta: Option<u64> = None;
+        for n in 0..4 {
+            if (self.inte & (1 << n)) != 0 {
+                if let Some(fire_us) = self.alarm_fire_us[n] {
+                    let delta = fire_us.saturating_sub(self.count_us);
+                    min_delta = Some(min_delta.map_or(delta, |m| m.min(delta)));
+                }
+            }
+        }
+        min_delta
+    }
+
     // -------------------------------------------------------------------
     // Register dispatch
     // -------------------------------------------------------------------

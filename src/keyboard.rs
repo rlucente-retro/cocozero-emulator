@@ -182,17 +182,21 @@ impl KeyboardMatrix {
     }
 
     /// Synchronize the keyboard matrix with the RP2350 bus for the current frame.
-    pub fn sync_frame(&mut self, bus: &mut Bus) {
+    ///
+    /// * `turbo`: simulation turbo factor (scales hold/gap countdowns so debounce duration in virtual time is invariant)
+    /// * `is_ready`: whether Color BASIC is initialized and ready to accept input
+    pub fn sync_frame(&mut self, bus: &mut Bus, turbo: u32, is_ready: bool) {
+        let t = turbo.max(1);
         // Advance typing state machine
         if self.hold_countdown > 0 {
             self.hold_countdown -= 1;
             if self.hold_countdown == 0 {
                 self.typed_matrix = [0xFF; 8];
-                self.gap_countdown = 2; // 2 frame release gap
+                self.gap_countdown = (2 * t).min(255) as u8; // 2 virtual 60 Hz frames release gap
             }
         } else if self.gap_countdown > 0 {
             self.gap_countdown -= 1;
-        } else if let Some(c) = self.type_queue.pop_front() {
+        } else if is_ready && let Some(c) = self.type_queue.pop_front() {
             if let Some((dscan, shift)) = kt_chord(c) {
                 self.typed_matrix = [0xFF; 8];
                 let (row, col) = dscan_to_row_col(dscan);
@@ -201,7 +205,8 @@ impl KeyboardMatrix {
                     let (s_row, s_col) = dscan_to_row_col(K_SHIFT);
                     self.typed_matrix[s_col as usize] &= !(1 << s_row);
                 }
-                self.hold_countdown = 4; // 4 frame hold duration (~66 ms)
+                self.hold_countdown = (4 * t).min(255) as u8; // 4 virtual 60 Hz frames hold duration (~66.7 ms)
+                eprintln!("[CoCo Keyboard] Injected key {:?} into matrix (held for {} virtual frames)", c, self.hold_countdown);
             }
         }
 

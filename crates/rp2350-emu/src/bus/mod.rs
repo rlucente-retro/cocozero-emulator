@@ -1291,9 +1291,11 @@ impl Bus {
         // arming with that timer pace observes a running accumulator.
         if !self.is_held_in_reset_bit(RESET_DMA) {
             if self.dma.needs_tick() {
+                let mut dma = std::mem::take(&mut self.dma);
                 for _ in 0..sys_clks {
-                    self.tick_dma();
+                    dma.tick(self);
                 }
+                self.dma = dma;
             }
             // HLD §4.5 follow-up: IRQ routing must run every quantum
             // regardless of whether channels/timers needed advancement.

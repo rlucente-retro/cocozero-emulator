@@ -627,11 +627,15 @@ impl CortexM33 {
             let prev = aligned.wrapping_sub(2);
             if is_cacheable_pc(prev) {
                 let slot = ((prev >> 1) & MASK) as usize;
-                self.decode_cache[slot] = empty;
+                if self.decode_cache[slot].tag == prev {
+                    self.decode_cache[slot] = empty;
+                }
             }
             if is_cacheable_pc(aligned) {
                 let slot = ((aligned >> 1) & MASK) as usize;
-                self.decode_cache[slot] = empty;
+                if self.decode_cache[slot].tag == aligned {
+                    self.decode_cache[slot] = empty;
+                }
             }
         }
     }

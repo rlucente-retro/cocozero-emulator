@@ -841,6 +841,39 @@ impl Emulator {
         if self.execution_model == ExecutionModel::Serial {
             let target = self.clock.cycles + cycles;
             while self.clock.cycles < target {
+                let both_waiting = match &self.cores {
+                    Cores::Arm(cs) => {
+                        (cs[0].is_halted() || cs[0].is_wfe_waiting())
+                            && (cs[1].is_halted() || cs[1].is_wfe_waiting())
+                    }
+                    Cores::RiscV(cs) => cs[0].is_halted() && cs[1].is_halted(),
+                };
+                if both_waiting {
+                    let remaining = target - self.clock.cycles;
+                    let mut max_skip = remaining;
+                    if let Some(delta0_us) = self.bus.timer0.next_alarm_delta_us() {
+                        let cyc = delta0_us.saturating_mul(12);
+                        max_skip = max_skip.min(cyc);
+                    }
+                    if let Some(delta1_us) = self.bus.timer1.next_alarm_delta_us() {
+                        let cyc = delta1_us.saturating_mul(12);
+                        max_skip = max_skip.min(cyc);
+                    }
+                    let skip = (max_skip as u32).min(32768);
+                    if skip > self.step_quantum {
+                        self.bus.master_cycle = self.clock.cycles;
+                        self.clock.advance(skip as u64);
+                        self.tick_peripherals(skip);
+                        if self.cores.is_arm() {
+                            self.tick_systick();
+                        }
+                        if self.cores.is_riscv() {
+                            self.fan_out_riscv_irqs();
+                        }
+                        self.wake_checks();
+                        continue;
+                    }
+                }
                 self.step_serial();
             }
             return Ok(self.clock.cycles);
@@ -1157,6 +1190,9 @@ impl Emulator {
                             || (pending != 0 && arm[i].ppb.any_pending_enabled(pending))
                         {
                             self.bus.atomics.clear_wfe_waiting(i);
+                            if arm[i].cycles < self.clock.cycles {
+                                arm[i].cycles = self.clock.cycles;
+                            }
                         }
                     }
                     // WFI wake: enabled pending IRQ clears WFI sleep.
@@ -1166,6 +1202,9 @@ impl Emulator {
                         let pending = self.bus.atomics.irq_pending_load(i);
                         if pending != 0 && arm[i].ppb.any_pending_enabled(pending) {
                             self.bus.atomics.clear_halted(i);
+                            if arm[i].cycles < self.clock.cycles {
+                                arm[i].cycles = self.clock.cycles;
+                            }
                         }
                     }
                 }
@@ -1443,7 +1482,7 @@ fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
             // value. Staleness is bounded by one instruction.
             let cyc = cs[core_id].cycles;
             cs[core_id].ppb.update_latest_cycles(cyc);
-            cs[core_id].step(bus);
+            cs[core_id].step_no_atomics(bus);
 
             // (c) Drain per-instruction cache-invalidation queue into
             // the core that just ran. Phase 3 follow-up #10 — the

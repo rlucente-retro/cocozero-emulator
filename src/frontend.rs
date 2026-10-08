@@ -39,10 +39,11 @@ pub struct Frontend {
 
 impl Frontend {
     pub fn new(headless: bool) -> Result<Self, String> {
+        sdl2::hint::set("SDL_MAC_BACKGROUND_APP", "0");
         let sdl = sdl2::init().map_err(|e| e.to_string())?;
         let video_subsystem = sdl.video().map_err(|e| e.to_string())?;
 
-        let window = if !headless {
+        let mut window = if !headless {
             video_subsystem
                 .window("CoCo Zero - Waveshare RP2350-PiZero Emulator", DISPLAY_WIDTH, DISPLAY_HEIGHT)
                 .position_centered()
@@ -56,9 +57,13 @@ impl Frontend {
                 .map_err(|e| e.to_string())?
         };
 
+        if !headless {
+            window.raise();
+            video_subsystem.text_input().start();
+        }
+
         let canvas = window
             .into_canvas()
-            .present_vsync()
             .build()
             .map_err(|e| e.to_string())?;
 
@@ -92,10 +97,6 @@ impl Frontend {
         };
 
         let event_pump = sdl.event_pump().map_err(|e| e.to_string())?;
-
-        if !headless {
-            video_subsystem.text_input().start();
-        }
 
         Ok(Self {
             _sdl: sdl,
@@ -156,28 +157,46 @@ impl Frontend {
     /// Returns false if user requested exit.
     pub fn poll_events(&mut self) -> bool {
         let events: Vec<Event> = self.event_pump.poll_iter().collect();
+        let has_text_input = events.iter().any(|e| matches!(e, Event::TextInput { .. }));
+
         for event in events {
             match event {
                 Event::Quit { .. } => return false,
                 Event::TextInput { text, .. } => {
-                    for c in text.chars() {
-                        self.typed_chars.push_back(c);
-                        self.serial_input_queue.push(c as u8);
+                    for ch in text.chars() {
+                        eprintln!("[Input] Window TextInput: {:?}", ch);
+                        self.typed_chars.push_back(ch);
                     }
                 }
                 Event::KeyDown {
-                    keycode: Some(key),
+                    keycode,
+                    scancode,
+                    keymod,
                     repeat,
                     ..
                 } => {
-                    if !repeat {
-                        self.handle_key_down(key);
+                    let key = keycode.or_else(|| scancode.and_then(Keycode::from_scancode));
+                    if let Some(key) = key {
+                        if !repeat {
+                            let shift = keymod.contains(sdl2::keyboard::Mod::LSHIFTMOD)
+                                || keymod.contains(sdl2::keyboard::Mod::RSHIFTMOD)
+                                || keymod.contains(sdl2::keyboard::Mod::CAPSMOD);
+                            self.handle_key_down(key, shift, has_text_input);
+                        }
                     }
                 }
                 Event::KeyUp {
-                    keycode: Some(key), ..
+                    keycode,
+                    scancode,
+                    ..
                 } => {
-                    self.handle_key_up(key);
+                    let key = keycode.or_else(|| scancode.and_then(Keycode::from_scancode));
+                    if let Some(key) = key {
+                        self.handle_key_up(key);
+                    }
+                }
+                Event::MouseButtonDown { .. } => {
+                    self.canvas.window_mut().raise();
                 }
                 _ => {}
             }
@@ -185,28 +204,49 @@ impl Frontend {
         true
     }
 
-    fn handle_key_down(&mut self, key: Keycode) {
+    fn handle_key_down(&mut self, key: Keycode, shift: bool, has_text_input: bool) {
         match key {
-            Keycode::Escape => {
-                self.typed_chars.push_back('\x1B');
-                self.serial_input_queue.push(0x1B);
-                self.key_events.push(InputKeyEvent::Down(key));
-            }
             Keycode::Return | Keycode::KpEnter => {
+                eprintln!("[Input] KeyDown: Enter");
                 self.typed_chars.push_back('\r');
-                self.serial_input_queue.push(0x0D);
-                self.key_events.push(InputKeyEvent::Down(key));
             }
-            Keycode::Backspace => {
+            Keycode::Backspace | Keycode::Delete => {
+                eprintln!("[Input] KeyDown: Backspace");
                 self.typed_chars.push_back('\x08');
-                self.serial_input_queue.push(0x08);
-                self.key_events.push(InputKeyEvent::Down(key));
+            }
+            Keycode::Escape => {
+                eprintln!("[Input] KeyDown: Break");
+                self.typed_chars.push_back('\x1B');
             }
             Keycode::Tab => {
+                eprintln!("[Input] KeyDown: Tab");
                 self.typed_chars.push_back('\t');
-                self.serial_input_queue.push(b'\t');
             }
-            Keycode::Up | Keycode::Down | Keycode::Left | Keycode::Right | Keycode::Space | Keycode::LShift | Keycode::RShift => {
+            Keycode::Home => {
+                eprintln!("[Input] KeyDown: Clear");
+                self.typed_chars.push_back('\x0C');
+            }
+            Keycode::Up => {
+                eprintln!("[Input] KeyDown: Up");
+                self.typed_chars.push_back('^');
+                self.key_events.push(InputKeyEvent::Down(key));
+            }
+            Keycode::Down => {
+                eprintln!("[Input] KeyDown: Down");
+                self.typed_chars.push_back('[');
+                self.key_events.push(InputKeyEvent::Down(key));
+            }
+            Keycode::Left => {
+                eprintln!("[Input] KeyDown: Left");
+                self.typed_chars.push_back('\x08');
+                self.key_events.push(InputKeyEvent::Down(key));
+            }
+            Keycode::Right => {
+                eprintln!("[Input] KeyDown: Right");
+                self.typed_chars.push_back(']');
+                self.key_events.push(InputKeyEvent::Down(key));
+            }
+            Keycode::LShift | Keycode::RShift => {
                 self.key_events.push(InputKeyEvent::Down(key));
             }
             Keycode::F1 => self.serial_input_queue.push(0x01), // INFO overlay toggle
@@ -214,17 +254,102 @@ impl Frontend {
             Keycode::F9 => self.serial_input_queue.push(0x0E), // Programs menu
             Keycode::F10 => self.serial_input_queue.push(0x0F), // Cartridges menu
             Keycode::F12 => self.serial_input_queue.push(0x10), // Disks menu
-            _ => {}
+            _ => {
+                // If TextInput is NOT handling this batch, fall back to keycode_to_char
+                if !has_text_input {
+                    if let Some(ch) = keycode_to_char(key, shift) {
+                        eprintln!("[Input] KeyDown (fallback): {:?}", ch);
+                        self.typed_chars.push_back(ch);
+                    }
+                }
+            }
         }
     }
 
     fn handle_key_up(&mut self, key: Keycode) {
         match key {
-            Keycode::Escape | Keycode::Return | Keycode::KpEnter | Keycode::Backspace |
-            Keycode::Up | Keycode::Down | Keycode::Left | Keycode::Right | Keycode::Space | Keycode::LShift | Keycode::RShift => {
+            Keycode::Up | Keycode::Down | Keycode::Left | Keycode::Right | Keycode::LShift | Keycode::RShift => {
                 self.key_events.push(InputKeyEvent::Up(key));
             }
             _ => {}
         }
+    }
+}
+
+pub fn keycode_to_char(key: Keycode, shift: bool) -> Option<char> {
+    match key {
+        Keycode::A => Some(if shift { 'A' } else { 'a' }),
+        Keycode::B => Some(if shift { 'B' } else { 'b' }),
+        Keycode::C => Some(if shift { 'C' } else { 'c' }),
+        Keycode::D => Some(if shift { 'D' } else { 'd' }),
+        Keycode::E => Some(if shift { 'E' } else { 'e' }),
+        Keycode::F => Some(if shift { 'F' } else { 'f' }),
+        Keycode::G => Some(if shift { 'G' } else { 'g' }),
+        Keycode::H => Some(if shift { 'H' } else { 'h' }),
+        Keycode::I => Some(if shift { 'I' } else { 'i' }),
+        Keycode::J => Some(if shift { 'J' } else { 'j' }),
+        Keycode::K => Some(if shift { 'K' } else { 'k' }),
+        Keycode::L => Some(if shift { 'L' } else { 'l' }),
+        Keycode::M => Some(if shift { 'M' } else { 'm' }),
+        Keycode::N => Some(if shift { 'N' } else { 'n' }),
+        Keycode::O => Some(if shift { 'O' } else { 'o' }),
+        Keycode::P => Some(if shift { 'P' } else { 'p' }),
+        Keycode::Q => Some(if shift { 'Q' } else { 'q' }),
+        Keycode::R => Some(if shift { 'R' } else { 'r' }),
+        Keycode::S => Some(if shift { 'S' } else { 's' }),
+        Keycode::T => Some(if shift { 'T' } else { 't' }),
+        Keycode::U => Some(if shift { 'U' } else { 'u' }),
+        Keycode::V => Some(if shift { 'V' } else { 'v' }),
+        Keycode::W => Some(if shift { 'W' } else { 'w' }),
+        Keycode::X => Some(if shift { 'X' } else { 'x' }),
+        Keycode::Y => Some(if shift { 'Y' } else { 'y' }),
+        Keycode::Z => Some(if shift { 'Z' } else { 'z' }),
+        Keycode::Num0 => Some(if shift { ')' } else { '0' }),
+        Keycode::Num1 => Some(if shift { '!' } else { '1' }),
+        Keycode::Num2 => Some(if shift { '@' } else { '2' }),
+        Keycode::Num3 => Some(if shift { '#' } else { '3' }),
+        Keycode::Num4 => Some(if shift { '$' } else { '4' }),
+        Keycode::Num5 => Some(if shift { '%' } else { '5' }),
+        Keycode::Num6 => Some(if shift { '^' } else { '6' }),
+        Keycode::Num7 => Some(if shift { '&' } else { '7' }),
+        Keycode::Num8 => Some(if shift { '*' } else { '8' }),
+        Keycode::Num9 => Some(if shift { '(' } else { '9' }),
+        Keycode::Space => Some(' '),
+        Keycode::Return | Keycode::KpEnter => Some('\r'),
+        Keycode::Backspace | Keycode::Delete => Some('\x08'),
+        Keycode::Tab => Some('\t'),
+        Keycode::Escape => Some('\x1B'),
+        Keycode::Minus => Some(if shift { '_' } else { '-' }),
+        Keycode::Equals => Some(if shift { '+' } else { '=' }),
+        Keycode::LeftBracket => Some(if shift { '{' } else { '[' }),
+        Keycode::RightBracket => Some(if shift { '}' } else { ']' }),
+        Keycode::Backslash => Some(if shift { '|' } else { '\\' }),
+        Keycode::Semicolon => Some(if shift { ':' } else { ';' }),
+        Keycode::Quote => Some(if shift { '"' } else { '\'' }),
+        Keycode::Comma => Some(if shift { '<' } else { ',' }),
+        Keycode::Period => Some(if shift { '>' } else { '.' }),
+        Keycode::Slash => Some(if shift { '?' } else { '/' }),
+        Keycode::Backquote => Some(if shift { '~' } else { '`' }),
+        Keycode::Kp0 => Some('0'),
+        Keycode::Kp1 => Some('1'),
+        Keycode::Kp2 => Some('2'),
+        Keycode::Kp3 => Some('3'),
+        Keycode::Kp4 => Some('4'),
+        Keycode::Kp5 => Some('5'),
+        Keycode::Kp6 => Some('6'),
+        Keycode::Kp7 => Some('7'),
+        Keycode::Kp8 => Some('8'),
+        Keycode::Kp9 => Some('9'),
+        Keycode::KpPlus => Some('+'),
+        Keycode::KpMinus => Some('-'),
+        Keycode::KpMultiply => Some('*'),
+        Keycode::KpDivide => Some('/'),
+        Keycode::KpPeriod => Some('.'),
+        Keycode::Up => Some('^'),
+        Keycode::Down => Some('['),
+        Keycode::Left => Some('\x08'),
+        Keycode::Right => Some(']'),
+        Keycode::Home => Some('\x0C'),
+        _ => None,
     }
 }
