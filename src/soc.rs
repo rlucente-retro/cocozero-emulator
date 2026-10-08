@@ -219,4 +219,91 @@ impl CoCoZeroSoC {
         }
         true
     }
+
+    /// Check whether a firmware menu overlay (Disks, Programs, Carts, Files, Info) is active.
+    pub fn is_menu_active(&self) -> bool {
+        self.emu.bus.memory.sram_read8(MENU_ACTIVE_ADDR - 0x2000_0000) != 0
+    }
+
+    /// Get current active menu mode (0 = Disks, 1 = Programs, 2 = Carts, 3 = Files, 4 = Info).
+    pub fn get_menu_mode(&self) -> u32 {
+        self.emu.bus.memory.sram_read32(MENU_MODE_ADDR - 0x2000_0000)
+    }
+
+    /// Inject a USB HID keycode report into the firmware's TinyUSB host handler on Core 0.
+    pub fn inject_hid_keycode(&mut self, keycode: u8) {
+        // Trampoline at TRAMP_ADDR: 'b .' (0xE7FE)
+        self.emu.bus.write16(TRAMP_ADDR, 0xE7FE, 0);
+
+        // 1. Send Key Press report [modifier, reserved, keycode, 0, 0, 0, 0, 0]
+        self.emu.bus.write8(HID_REPORT_ADDR, 0, 0);     // modifier
+        self.emu.bus.write8(HID_REPORT_ADDR + 1, 0, 0); // reserved
+        self.emu.bus.write8(HID_REPORT_ADDR + 2, keycode, 0); // keycode[0]
+        for i in 3..8 {
+            self.emu.bus.write8(HID_REPORT_ADDR + i, 0, 0);
+        }
+
+        let saved_r = self.emu.core(0).regs.r;
+        let saved_xpsr = self.emu.core(0).regs.xpsr;
+        let saved_msp = self.emu.core(0).regs.msp;
+
+        self.emu.core_mut(0).regs.r[0] = 1; // dev_addr = 1
+        self.emu.core_mut(0).regs.r[1] = 0; // instance = 0
+        self.emu.core_mut(0).regs.r[2] = HID_REPORT_ADDR;
+        self.emu.core_mut(0).regs.r[3] = 8; // len = 8
+        self.emu.core_mut(0).regs.r[14] = TRAMP_ADDR | 1;
+        self.emu.core_mut(0).regs.set_pc(HID_CB_ADDR);
+
+        for _ in 0..10_000 {
+            let _ = self.emu.run(100);
+            if self.emu.core(0).regs.pc() == TRAMP_ADDR {
+                break;
+            }
+        }
+
+        // 2. Send Key Release report [0, 0, 0, 0, 0, 0, 0, 0]
+        self.emu.bus.write8(HID_REPORT_ADDR + 2, 0, 0);
+        self.emu.core_mut(0).regs.r[0] = 1;
+        self.emu.core_mut(0).regs.r[1] = 0;
+        self.emu.core_mut(0).regs.r[2] = HID_REPORT_ADDR;
+        self.emu.core_mut(0).regs.r[3] = 8;
+        self.emu.core_mut(0).regs.r[14] = TRAMP_ADDR | 1;
+        self.emu.core_mut(0).regs.set_pc(HID_CB_ADDR);
+
+        for _ in 0..10_000 {
+            let _ = self.emu.run(100);
+            if self.emu.core(0).regs.pc() == TRAMP_ADDR {
+                break;
+            }
+        }
+
+        // Restore Core 0 registers so it resumes previous execution cleanly
+        self.emu.core_mut(0).regs.r = saved_r;
+        self.emu.core_mut(0).regs.xpsr = saved_xpsr;
+        self.emu.core_mut(0).regs.msp = saved_msp;
+    }
+
+    /// Trigger a menu mode directly (0=Disks, 1=Programs, 2=Carts, 3=Files, 4=Info).
+    pub fn trigger_menu(&mut self, mode: u32) {
+        let keycode = match mode {
+            0 => 0x45, // F12 Disks
+            1 => 0x42, // F9 Programs
+            2 => 0x43, // F10 Cartridges
+            3 => 0x44, // F11 Files
+            4 => 0x3A, // F1 Info
+            _ => 0x45,
+        };
+        self.inject_hid_keycode(keycode);
+    }
 }
+
+/// Physical SRAM address of menu active flag (1 = active, 0 = inactive).
+pub const MENU_ACTIVE_ADDR: u32 = 0x2001_28e8;
+/// Physical SRAM address of active menu mode (0 = Disks, 1 = Programs, 2 = Carts, 3 = Files, 4 = Info).
+pub const MENU_MODE_ADDR: u32 = 0x2004_a2b8;
+/// Physical SRAM address of TinyUSB HID keyboard report buffer.
+pub const HID_REPORT_ADDR: u32 = 0x2006_03e8;
+/// Entry point of TinyUSB host HID report callback in firmware flash.
+pub const HID_CB_ADDR: u32 = 0x1001_e784;
+/// Scratch trampoline location in upper SRAM.
+pub const TRAMP_ADDR: u32 = 0x2007_ffe0;

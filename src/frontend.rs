@@ -34,6 +34,7 @@ pub struct Frontend {
     pub serial_input_queue: Vec<u8>,
     pub typed_chars: VecDeque<char>,
     pub key_events: Vec<InputKeyEvent>,
+    pub hid_key_queue: VecDeque<u8>,
     pub key_matrix: [u8; 8], // 8x8 CoCo keyboard matrix
 }
 
@@ -108,6 +109,7 @@ impl Frontend {
             serial_input_queue: Vec::new(),
             typed_chars: VecDeque::new(),
             key_events: Vec::new(),
+            hid_key_queue: VecDeque::new(),
             key_matrix: [0xFF; 8],
         })
     }
@@ -155,7 +157,7 @@ impl Frontend {
 
     /// Poll SDL events and translate them to keyboard / control signals.
     /// Returns false if user requested exit.
-    pub fn poll_events(&mut self) -> bool {
+    pub fn poll_events(&mut self, is_menu_active: bool) -> bool {
         let events: Vec<Event> = self.event_pump.poll_iter().collect();
         let has_text_input = events.iter().any(|e| matches!(e, Event::TextInput { .. }));
 
@@ -163,9 +165,12 @@ impl Frontend {
             match event {
                 Event::Quit { .. } => return false,
                 Event::TextInput { text, .. } => {
-                    for ch in text.chars() {
-                        eprintln!("[Input] Window TextInput: {:?}", ch);
-                        self.typed_chars.push_back(ch);
+                    // Only process TextInput for Color BASIC typing if menu overlay is not active
+                    if !is_menu_active {
+                        for ch in text.chars() {
+                            eprintln!("[Input] Window TextInput: {:?}", ch);
+                            self.typed_chars.push_back(ch);
+                        }
                     }
                 }
                 Event::KeyDown {
@@ -176,13 +181,17 @@ impl Frontend {
                     ..
                 } => {
                     let key = keycode.or_else(|| scancode.and_then(Keycode::from_scancode));
-                    if let Some(key) = key {
-                        if !repeat {
-                            let shift = keymod.contains(sdl2::keyboard::Mod::LSHIFTMOD)
-                                || keymod.contains(sdl2::keyboard::Mod::RSHIFTMOD)
-                                || keymod.contains(sdl2::keyboard::Mod::CAPSMOD);
-                            self.handle_key_down(key, shift, has_text_input);
-                        }
+                    if let Some(key) = key
+                        && !repeat
+                    {
+                        let shift = keymod.contains(sdl2::keyboard::Mod::LSHIFTMOD)
+                            || keymod.contains(sdl2::keyboard::Mod::RSHIFTMOD)
+                            || keymod.contains(sdl2::keyboard::Mod::CAPSMOD);
+                        let cmd_or_ctrl = keymod.contains(sdl2::keyboard::Mod::LGUIMOD)
+                            || keymod.contains(sdl2::keyboard::Mod::RGUIMOD)
+                            || keymod.contains(sdl2::keyboard::Mod::LCTRLMOD)
+                            || keymod.contains(sdl2::keyboard::Mod::RCTRLMOD);
+                        self.handle_key_down(key, shift, cmd_or_ctrl, is_menu_active, has_text_input);
                     }
                 }
                 Event::KeyUp {
@@ -204,7 +213,107 @@ impl Frontend {
         true
     }
 
-    fn handle_key_down(&mut self, key: Keycode, shift: bool, has_text_input: bool) {
+    fn handle_key_down(
+        &mut self,
+        key: Keycode,
+        shift: bool,
+        cmd_or_ctrl: bool,
+        is_menu_active: bool,
+        has_text_input: bool,
+    ) {
+        // 1. Function Keys and macOS Command/Control shortcuts
+        if key == Keycode::F12 || (cmd_or_ctrl && key == Keycode::D) {
+            eprintln!("[Menu] F12 / Cmd+D -> Disks menu");
+            self.hid_key_queue.push_back(0x45); // HID F12
+            return;
+        }
+        if key == Keycode::F9 || (cmd_or_ctrl && key == Keycode::P) {
+            eprintln!("[Menu] F9 / Cmd+P -> Programs menu");
+            self.hid_key_queue.push_back(0x42); // HID F9
+            return;
+        }
+        if key == Keycode::F10 || (cmd_or_ctrl && key == Keycode::C) {
+            eprintln!("[Menu] F10 / Cmd+C -> Cartridges menu");
+            self.hid_key_queue.push_back(0x43); // HID F10
+            return;
+        }
+        if key == Keycode::F11 {
+            eprintln!("[Menu] F11 -> Files menu");
+            self.hid_key_queue.push_back(0x44); // HID F11
+            return;
+        }
+        if key == Keycode::F1 || (cmd_or_ctrl && key == Keycode::I) {
+            eprintln!("[Menu] F1 / Cmd+I -> Info overlay");
+            self.hid_key_queue.push_back(0x3A); // HID F1
+            return;
+        }
+        if key == Keycode::F8 || (cmd_or_ctrl && key == Keycode::A) {
+            eprintln!("[Menu] F8 / Cmd+A -> Artifact colors toggle");
+            self.hid_key_queue.push_back(0x41); // HID F8
+            return;
+        }
+
+        // 2. When menu overlay is active, route navigation keys directly to menu
+        if is_menu_active {
+            match key {
+                Keycode::Up => {
+                    eprintln!("[Menu Nav] Up");
+                    self.hid_key_queue.push_back(0x52); // HID KEY_UP
+                }
+                Keycode::Down => {
+                    eprintln!("[Menu Nav] Down");
+                    self.hid_key_queue.push_back(0x51); // HID KEY_DOWN
+                }
+                Keycode::PageUp => {
+                    eprintln!("[Menu Nav] PageUp");
+                    self.hid_key_queue.push_back(0x4B); // HID KEY_PAGE_UP
+                }
+                Keycode::PageDown => {
+                    eprintln!("[Menu Nav] PageDown");
+                    self.hid_key_queue.push_back(0x4E); // HID KEY_PAGE_DOWN
+                }
+                Keycode::Left => {
+                    eprintln!("[Menu Nav] Left");
+                    self.hid_key_queue.push_back(0x50); // HID KEY_LEFT
+                }
+                Keycode::Right => {
+                    eprintln!("[Menu Nav] Right");
+                    self.hid_key_queue.push_back(0x4F); // HID KEY_RIGHT
+                }
+                Keycode::Return | Keycode::KpEnter => {
+                    eprintln!("[Menu Nav] Select (Return)");
+                    self.hid_key_queue.push_back(0x28); // HID KEY_ENTER
+                }
+                Keycode::Escape => {
+                    eprintln!("[Menu Nav] Cancel (Escape)");
+                    self.hid_key_queue.push_back(0x29); // HID KEY_ESCAPE
+                }
+                Keycode::Tab => {
+                    eprintln!("[Menu Nav] Tab");
+                    self.hid_key_queue.push_back(0x2B); // HID KEY_TAB
+                }
+                Keycode::Num0 | Keycode::Kp0 => {
+                    eprintln!("[Menu Nav] Drive 0");
+                    self.hid_key_queue.push_back(0x27); // HID '0'
+                }
+                Keycode::Num1 | Keycode::Kp1 => {
+                    eprintln!("[Menu Nav] Drive 1");
+                    self.hid_key_queue.push_back(0x1E); // HID '1'
+                }
+                Keycode::Num2 | Keycode::Kp2 => {
+                    eprintln!("[Menu Nav] Drive 2");
+                    self.hid_key_queue.push_back(0x1F); // HID '2'
+                }
+                Keycode::Num3 | Keycode::Kp3 => {
+                    eprintln!("[Menu Nav] Drive 3");
+                    self.hid_key_queue.push_back(0x20); // HID '3'
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // 3. Normal typing when menu is not active (Color BASIC typing)
         match key {
             Keycode::Return | Keycode::KpEnter => {
                 eprintln!("[Input] KeyDown: Enter");
@@ -249,18 +358,13 @@ impl Frontend {
             Keycode::LShift | Keycode::RShift => {
                 self.key_events.push(InputKeyEvent::Down(key));
             }
-            Keycode::F1 => self.serial_input_queue.push(0x01), // INFO overlay toggle
-            Keycode::F8 => self.serial_input_queue.push(0x06), // Artifact color cycle
-            Keycode::F9 => self.serial_input_queue.push(0x0E), // Programs menu
-            Keycode::F10 => self.serial_input_queue.push(0x0F), // Cartridges menu
-            Keycode::F12 => self.serial_input_queue.push(0x10), // Disks menu
             _ => {
                 // If TextInput is NOT handling this batch, fall back to keycode_to_char
-                if !has_text_input {
-                    if let Some(ch) = keycode_to_char(key, shift) {
-                        eprintln!("[Input] KeyDown (fallback): {:?}", ch);
-                        self.typed_chars.push_back(ch);
-                    }
+                if !has_text_input
+                    && let Some(ch) = keycode_to_char(key, shift)
+                {
+                    eprintln!("[Input] KeyDown (fallback): {:?}", ch);
+                    self.typed_chars.push_back(ch);
                 }
             }
         }

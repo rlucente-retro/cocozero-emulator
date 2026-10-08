@@ -172,10 +172,16 @@ fn main() {
     let mut basic_ready_announced = false;
 
     loop {
-        // Poll frontend input events
-        if !frontend.poll_events() {
+        // Poll frontend input events (pass current menu active state)
+        let is_menu_active = soc.is_menu_active();
+        if !frontend.poll_events(is_menu_active) {
             println!("\nExit requested by user.");
             break;
+        }
+
+        // Drain HID keycodes for menu operation (F1..F12, navigation, drive selection)
+        while let Some(hid_code) = frontend.hid_key_queue.pop_front() {
+            soc.inject_hid_keycode(hid_code);
         }
 
         // Forward physical key events (arrows, space, etc.)
