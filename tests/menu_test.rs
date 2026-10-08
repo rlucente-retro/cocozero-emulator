@@ -8,6 +8,7 @@ use std::path::Path;
 fn test_menu_activation() {
     let sd_path = Path::new("coco");
     let sd_bytes = build_virtual_fat32(sd_path).expect("Failed to build virtual FAT32");
+
     let storage = Box::new(MemoryStorage::from_bytes(sd_bytes));
 
     let mut soc = CoCoZeroSoC::new(storage).expect("Failed to create SoC");
@@ -26,29 +27,6 @@ fn test_menu_activation() {
     let mut fb_before = [0u16; FB_PIXELS];
     soc.extract_frame(&mut fb_before);
 
-    // Inspect values at 0x200128E8 and 0x2004A2B8
-    let menu_active = soc.emu.bus.memory.sram_read8(0x128e8);
-    let menu_mode = soc.emu.bus.memory.sram_read32(0x4a2b8);
-    let c6f8 = soc.emu.bus.memory.sram_read32(0xc6f8);
-    println!("At frame 150: menu_active={}, menu_mode={}, c6f8=0x{:08X}",
-        menu_active, menu_mode, c6f8);
-
-    print!("menu struct before: ");
-    for i in 0..16 {
-        let w = soc.emu.bus.read32(0x200128E8 + i * 4, 0);
-        print!("0x{:08X} ", w);
-    }
-    println!();
-
-    // Dump words around Core0 PC
-    let pc = soc.emu.core(0).regs.pc();
-    print!("Code at PC: ");
-    for i in 0..8 {
-        let hw = soc.emu.bus.read16(pc + i * 2, 0);
-        print!("{:04X} ", hw);
-    }
-    println!();
-
     // Verify initially menu is not active
     assert!(!soc.is_menu_active(), "Menu should initially be inactive");
 
@@ -56,6 +34,10 @@ fn test_menu_activation() {
     soc.inject_hid_keycode(0x45);
     assert!(soc.is_menu_active(), "Menu should be active after F12 injection");
     assert_eq!(soc.get_menu_mode(), 0, "Menu mode should be 0 (Disks)");
+
+    // Verify that the disk directory scan populated ZORK1.DSK
+    let disk_count = soc.emu.bus.read32(0x2001_498C, 0);
+    assert_eq!(disk_count, 1, "SD directory scan should find 1 disk image");
 
     // Step 5 frames to let Core 0 render the menu
     for _ in 0..5 {
