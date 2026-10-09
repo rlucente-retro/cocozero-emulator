@@ -25,6 +25,10 @@ struct Args {
     #[arg(short, long)]
     bin: Option<PathBuf>,
 
+    /// Optional path to firmware ELF binary (.elf) for dynamic symbol extraction
+    #[arg(long)]
+    elf: Option<PathBuf>,
+
     /// Path to RP2350 Boot ROM binary (.bin)
     #[arg(long, default_value = "roms/rp2350/bootrom-combined.bin")]
     bootrom: PathBuf,
@@ -86,14 +90,6 @@ fn main() {
     println!("Initializing RP2350B SoC engine...");
     let mut soc = CoCoZeroSoC::new(sd_storage).expect("Failed to initialize SoC");
 
-    if let Some(fb_str) = &args.fb_addr {
-        let clean = fb_str.trim_start_matches("0x").trim_start_matches("0X");
-        if let Ok(addr) = u32::from_str_radix(clean, 16) {
-            println!("Forcing framebuffer address to 0x{:08X}", addr);
-            soc.fb_addr = Some(addr);
-        }
-    }
-
     // 3. Load Boot ROM if present
     if args.bootrom.exists() {
         println!("Loading RP2350 Boot ROM: {}", args.bootrom.display());
@@ -112,13 +108,13 @@ fn main() {
             "Flash image loaded: 0x{:08X} - 0x{:08X} (Entry PC: {:?}, Initial SP: {:?})",
             flash.min_addr, flash.max_addr, flash.entry_point, flash.initial_sp
         );
-        soc.load_firmware(&flash);
+        soc.load_firmware_with_elf(&flash, args.elf.as_deref());
     } else if let Some(bin_path) = &args.bin {
         println!("Loading raw binary: {}", bin_path.display());
         let bin_data = std::fs::read(bin_path).expect("Failed to read binary file");
         let mut flash = FlashImage::new(16 * 1024 * 1024);
         flash.load_raw_bin(0, &bin_data);
-        soc.load_firmware(&flash);
+        soc.load_firmware_with_elf(&flash, args.elf.as_deref());
     } else {
         let default_uf2 = Path::new("roms/cocozero.uf2");
         if default_uf2.is_file() {
@@ -129,10 +125,18 @@ fn main() {
                 "Flash image loaded: 0x{:08X} - 0x{:08X} (Entry PC: {:?}, Initial SP: {:?})",
                 flash.min_addr, flash.max_addr, flash.entry_point, flash.initial_sp
             );
-            soc.load_firmware(&flash);
+            soc.load_firmware_with_elf(&flash, args.elf.as_deref());
         } else {
             println!("Warning: No firmware (--uf2 or --bin) specified.");
             println!("Running Boot ROM idle/USB boot loop.");
+        }
+    }
+
+    if let Some(fb_str) = &args.fb_addr {
+        let clean = fb_str.trim_start_matches("0x").trim_start_matches("0X");
+        if let Ok(addr) = u32::from_str_radix(clean, 16) {
+            println!("Explicit CLI override: forcing framebuffer address to 0x{:08X}", addr);
+            soc.fb_addr = Some(addr);
         }
     }
 

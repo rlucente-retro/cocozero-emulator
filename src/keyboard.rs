@@ -1,14 +1,14 @@
 //! CoCo Zero Keyboard Matrix Emulation.
 //!
 //! Maps standard PC / USB keyboard keys and ASCII characters to the
-//! Tandy Color Computer 2 keyboard matrix (8 columns x 7 rows) at SRAM address `0x2000_b1fc`.
+//! Tandy Color Computer 2 keyboard matrix (8 columns x 7 rows) at SRAM address `0x2000_b304`.
 
 use rp2350_emu::bus::Bus;
 use sdl2::keyboard::Keycode;
 use std::collections::VecDeque;
 
 /// Physical SRAM address of `g_kb_col_row_mask` in the CoCo Zero firmware.
-pub const KB_MATRIX_ADDR: u32 = 0x2000_b1fc;
+pub const KB_MATRIX_ADDR: u32 = 0x2000_b304;
 
 // Scancodes as defined by XRoar's dkbd and key_translate.h
 pub const K_0: u8 = 0x00;
@@ -115,6 +115,8 @@ pub fn keycode_to_dscan(key: Keycode) -> Option<u8> {
 
 /// Emulated Keyboard Matrix Controller.
 pub struct KeyboardMatrix {
+    /// Physical SRAM address of `g_kb_col_row_mask`.
+    pub matrix_addr: u32,
     /// Active-low matrix for physical key hold/release (0 = pressed, 1 = unpressed).
     physical_matrix: [u8; 8],
     /// Active-low matrix for currently typing character.
@@ -137,6 +139,7 @@ impl KeyboardMatrix {
     /// Create a new, idle keyboard matrix controller.
     pub fn new() -> Self {
         Self {
+            matrix_addr: KB_MATRIX_ADDR,
             physical_matrix: [0xFF; 8],
             typed_matrix: [0xFF; 8],
             type_queue: VecDeque::new(),
@@ -213,7 +216,7 @@ impl KeyboardMatrix {
         // Combine physical layer and typed character layer (bitwise AND: active low)
         for c in 0..8 {
             let col_mask = self.physical_matrix[c] & self.typed_matrix[c];
-            bus.write8(KB_MATRIX_ADDR + c as u32, col_mask, 0);
+            bus.write8(self.matrix_addr + c as u32, col_mask, 0);
         }
     }
 }

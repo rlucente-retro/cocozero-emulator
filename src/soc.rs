@@ -15,6 +15,7 @@ use rp2350_emu::{Config, Emulator, EmulatorBuilder};
 
 use crate::keyboard::KeyboardMatrix;
 use crate::spi_sd::{SectorStorage, SpiSdCard};
+use crate::symbols::FirmwareSymbols;
 use crate::uf2::FlashImage;
 
 pub const SYS_CLK_HZ: u32 = 252_000_000;
@@ -32,6 +33,7 @@ pub struct CoCoZeroSoC {
     pub total_cycles: u64,
     pub keyboard_ready_forced: bool,
     pub keyboard: KeyboardMatrix,
+    pub symbols: FirmwareSymbols,
 }
 
 impl CoCoZeroSoC {
@@ -62,22 +64,35 @@ impl CoCoZeroSoC {
             let _ = std::io::stdout().flush();
         }));
 
+        let symbols = FirmwareSymbols::default();
         Ok(Self {
             emu,
             sd_card,
             serial_tx_log,
             serial_rx_queue: VecDeque::new(),
-            fb_addr: Some(0x2002_2794),
+            fb_addr: Some(symbols.fb_addr),
             frame_counter: 0,
             total_cycles: 0,
             keyboard_ready_forced: false,
             keyboard: KeyboardMatrix::new(),
+            symbols,
         })
     }
 
     /// Load Flash memory image (from UF2 or raw binary) into XIP Flash space.
     pub fn load_firmware(&mut self, flash: &FlashImage) {
+        self.load_firmware_with_elf(flash, None);
+    }
+
+    /// Load Flash memory image with an optional companion ELF file for symbol extraction.
+    pub fn load_firmware_with_elf(&mut self, flash: &FlashImage, elf_path: Option<&std::path::Path>) {
         self.emu.load_flash(&flash.memory);
+
+        // Auto-detect firmware symbols from ELF or in-flash signatures
+        let syms = FirmwareSymbols::auto_detect(elf_path, &flash.memory, crate::uf2::FLASH_BASE);
+        self.symbols = syms;
+        self.fb_addr = Some(syms.fb_addr);
+        self.keyboard.matrix_addr = syms.kb_matrix_addr;
 
         // If bootrom is not loaded, initialize core 0 registers directly from flash vector table
         if let (Some(sp), Some(pc)) = (flash.initial_sp, flash.entry_point) {
@@ -209,7 +224,7 @@ impl CoCoZeroSoC {
 
     /// Extract the 320×240 RGB565 frame from SRAM for rendering.
     pub fn extract_frame(&mut self, out: &mut [u16; FB_PIXELS]) -> bool {
-        let addr = self.fb_addr.unwrap_or(0x2002_2794);
+        let addr = self.fb_addr.unwrap_or(self.symbols.fb_addr);
         let offset = addr.saturating_sub(0x2000_0000);
         let mem = &self.emu.bus.memory;
         for i in 0..(FB_PIXELS / 2) {
@@ -222,12 +237,12 @@ impl CoCoZeroSoC {
 
     /// Check whether a firmware menu overlay (Disks, Programs, Carts, Files, Info) is active.
     pub fn is_menu_active(&self) -> bool {
-        self.emu.bus.memory.sram_read8(MENU_ACTIVE_ADDR - 0x2000_0000) != 0
+        self.emu.bus.memory.sram_read8(self.symbols.menu_active_addr - 0x2000_0000) != 0
     }
 
     /// Get current active menu mode (0 = Disks, 1 = Programs, 2 = Carts, 3 = Files, 4 = Info).
     pub fn get_menu_mode(&self) -> u32 {
-        self.emu.bus.memory.sram_read32(MENU_MODE_ADDR - 0x2000_0000)
+        self.emu.bus.memory.sram_read32(self.symbols.menu_mode_addr - 0x2000_0000)
     }
 
     /// Inject a USB HID keycode report into the firmware's TinyUSB host handler on Core 0.
@@ -235,12 +250,15 @@ impl CoCoZeroSoC {
         // Trampoline at TRAMP_ADDR: 'b .' (0xE7FE)
         self.emu.bus.write16(TRAMP_ADDR, 0xE7FE, 0);
 
+        // Dedicated scratch HID report buffer located right below trampoline in upper SRAM
+        let report_addr = TRAMP_ADDR - 0x10;
+
         // 1. Send Key Press report [modifier, reserved, keycode, 0, 0, 0, 0, 0]
-        self.emu.bus.write8(HID_REPORT_ADDR, 0, 0);     // modifier
-        self.emu.bus.write8(HID_REPORT_ADDR + 1, 0, 0); // reserved
-        self.emu.bus.write8(HID_REPORT_ADDR + 2, keycode, 0); // keycode[0]
+        self.emu.bus.write8(report_addr, 0, 0);     // modifier
+        self.emu.bus.write8(report_addr + 1, 0, 0); // reserved
+        self.emu.bus.write8(report_addr + 2, keycode, 0); // keycode[0]
         for i in 3..8 {
-            self.emu.bus.write8(HID_REPORT_ADDR + i, 0, 0);
+            self.emu.bus.write8(report_addr + i, 0, 0);
         }
 
         let saved_r = self.emu.core(0).regs.r;
@@ -249,10 +267,10 @@ impl CoCoZeroSoC {
 
         self.emu.core_mut(0).regs.r[0] = 1; // dev_addr = 1
         self.emu.core_mut(0).regs.r[1] = 0; // instance = 0
-        self.emu.core_mut(0).regs.r[2] = HID_REPORT_ADDR;
+        self.emu.core_mut(0).regs.r[2] = report_addr;
         self.emu.core_mut(0).regs.r[3] = 8; // len = 8
         self.emu.core_mut(0).regs.r[14] = TRAMP_ADDR | 1;
-        self.emu.core_mut(0).regs.set_pc(HID_CB_ADDR);
+        self.emu.core_mut(0).regs.set_pc(self.symbols.hid_cb_addr);
 
         for _ in 0..10_000 {
             let _ = self.emu.run(100);
@@ -262,13 +280,13 @@ impl CoCoZeroSoC {
         }
 
         // 2. Send Key Release report [0, 0, 0, 0, 0, 0, 0, 0]
-        self.emu.bus.write8(HID_REPORT_ADDR + 2, 0, 0);
+        self.emu.bus.write8(report_addr + 2, 0, 0);
         self.emu.core_mut(0).regs.r[0] = 1;
         self.emu.core_mut(0).regs.r[1] = 0;
-        self.emu.core_mut(0).regs.r[2] = HID_REPORT_ADDR;
+        self.emu.core_mut(0).regs.r[2] = report_addr;
         self.emu.core_mut(0).regs.r[3] = 8;
         self.emu.core_mut(0).regs.r[14] = TRAMP_ADDR | 1;
-        self.emu.core_mut(0).regs.set_pc(HID_CB_ADDR);
+        self.emu.core_mut(0).regs.set_pc(self.symbols.hid_cb_addr);
 
         for _ in 0..10_000 {
             let _ = self.emu.run(100);
@@ -298,12 +316,12 @@ impl CoCoZeroSoC {
 }
 
 /// Physical SRAM address of menu active flag (1 = active, 0 = inactive).
-pub const MENU_ACTIVE_ADDR: u32 = 0x2001_2938;
+pub const MENU_ACTIVE_ADDR: u32 = 0x2000_c8d0;
 /// Physical SRAM address of active menu mode (0 = Disks, 1 = Programs, 2 = Carts, 3 = Files, 4 = Info).
-pub const MENU_MODE_ADDR: u32 = 0x2004_a308;
+pub const MENU_MODE_ADDR: u32 = 0x2000_c8d4;
 /// Physical SRAM address of TinyUSB HID keyboard report buffer.
-pub const HID_REPORT_ADDR: u32 = 0x2006_0438;
+pub const HID_REPORT_ADDR: u32 = 0x2001_c18c;
 /// Entry point of TinyUSB host HID report callback in firmware flash.
-pub const HID_CB_ADDR: u32 = 0x1001_e7c0;
+pub const HID_CB_ADDR: u32 = 0x1001_f460;
 /// Scratch trampoline location in upper SRAM.
 pub const TRAMP_ADDR: u32 = 0x2007_ffe0;

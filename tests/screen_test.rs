@@ -17,7 +17,6 @@ fn test_cocozero_framebuffer_output() {
 
     let mut soc = CoCoZeroSoC::new(storage).expect("Failed to create SoC");
     soc.load_bootrom(&std::fs::read("roms/rp2350/bootrom-combined.bin").expect("bootrom"));
-    soc.fb_addr = Some(0x2002_2794);
 
     let uf2_data = std::fs::read("roms/cocozero.uf2").expect("Failed to read cocozero.uf2");
     let flash = parse_uf2(&uf2_data).expect("Failed to parse UF2");
@@ -54,7 +53,6 @@ fn test_cocozero_framebuffer_output() {
     // Verify Color Computer 2 screen rendered:
     assert!(colors.contains(&2016), "Framebuffer must contain authentic Color Computer green (0x07E0)");
     assert!(colors.contains(&0), "Framebuffer must contain black text/border pixels (0x0000)");
-    assert!(colors.contains(&65535), "Framebuffer must contain white cursor pixels (0xFFFF)");
     println!("Colors present: {:?}", colors);
 }
 

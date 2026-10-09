@@ -29,7 +29,24 @@ sudo apt-get update
 sudo apt-get install -y libsdl2-dev pkg-config build-essential
 ```
 
-### 2. Build and Run
+### 2. Firmware Setup & Upstream Updates
+
+The emulator runs bare-metal CoCo Zero firmware built from [ugufru/xroar-waveshare-rp2350-pizero](https://github.com/ugufru/xroar-waveshare-rp2350-pizero).
+
+To incorporate recent builds or update to the latest upstream release, copy the compiled PlatformIO build artifacts from your local clone into the `roms/` directory:
+
+```bash
+# Copy the UF2 firmware flash image:
+cp /path/to/xroar-waveshare-rp2350-pizero/.pio/build/pizero_stream_60/firmware.uf2 roms/cocozero.uf2
+
+# Copy the ELF binary for automatic dynamic symbol extraction:
+cp /path/to/xroar-waveshare-rp2350-pizero/.pio/build/pizero_stream_60/firmware.elf roms/cocozero.elf
+```
+
+> **Note on Dynamic Symbol Resolution:**
+> The emulator automatically extracts physical symbol addresses (framebuffer base, keyboard matrix bitmasks, OSD overlay state, and TinyUSB HID callbacks) from `roms/cocozero.elf` at startup. This guarantees that upstream firmware rebuilds and memory relocations work immediately without modifying hardcoded addresses or recompiling the emulator. If no ELF file is provided, the emulator falls back to in-flash opcode and literal pool signature scanning.
+
+### 3. Build and Run
 
 Launch the emulator with real-time 60 FPS performance:
 
@@ -38,7 +55,7 @@ cargo run --release -- --turbo 6
 ```
 
 By default, the emulator automatically loads:
-- **Firmware:** `roms/cocozero.uf2`
+- **Firmware:** `roms/cocozero.uf2` (with symbols from `roms/cocozero.elf`)
 - **Boot ROM:** `roms/rp2350/bootrom-combined.bin`
 - **Storage:** The local `./coco/` directory mounted as a virtual FAT32 MicroSD card.
 
@@ -91,6 +108,8 @@ Usage: cocozero-rp2350 [OPTIONS]
 | `-s, --sd <PATH>` | Host directory to mount as virtual SD card, or path to a raw `.img` file. | `./coco` |
 | `-u, --uf2 <PATH>` | Path to a custom firmware UF2 binary. | `roms/cocozero.uf2` |
 | `-b, --bin <PATH>` | Path to a raw flash binary (`.bin`). | *None* |
+| `--elf <PATH>` | Path to firmware ELF binary (`.elf`) for dynamic symbol extraction. | `roms/cocozero.elf` (if present) |
+| `--fb-addr <ADDR>` | Override framebuffer SRAM address (e.g. `0x20022900`). | *Auto-detected* |
 | `--bootrom <PATH>` | Path to RP2350 Boot ROM binary. | `roms/rp2350/bootrom-combined.bin` |
 | `--headless` | Run without an SDL2 GUI window (for benchmarks / scripting). | `false` |
 | `--max-frames <N>` | Exit after `N` frames (`0` = run indefinitely). | `0` |

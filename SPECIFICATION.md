@@ -230,10 +230,13 @@ By setting the system clock to **252.000 MHz** and operating with a **25.200 MHz
 - **`6847t2` (Default):** Enhanced character set providing true lowercase permanently, true ASCII caret `^`, true underscore `_`, and full braces `{`, `|`, `}`, `~`.
 - **`lowercase = on` (Default):** Overrides Color BASIC's automatic prompt resets, maintaining lowercase display active even after `PRINT` statements and prompt redrawing.
 
-### 3.5 Host Emulator Display Pipeline & Framebuffer Extraction
+### 3.5 Host Emulator Display Pipeline & Dynamic Symbol Resolution
 
 The host emulator bridges RP2350 SRAM video generation to modern host display servers using SDL2:
-- **Framebuffer Discovery:** Default framebuffer is located at SRAM address `0x2002_2794`. If relocations occur, `detect_framebuffer()` executes a heuristic scan across SRAM (`0x2000_0000..0x2008_0000`) in 1 KB increments searching for active RGB565 raster data. Users can override this explicitly via `--fb-addr <ADDR>`.
+- **Dynamic Symbol Resolution:** To accommodate upstream firmware rebuilds without recompiling the emulator, the engine automatically extracts critical symbol addresses at startup via `FirmwareSymbols`:
+  1. *Companion ELF Analysis:* If a companion ELF file exists (`roms/cocozero.elf` or `--elf <PATH>`), the emulator parses the 32-bit ELF symbol table (`.symtab`), extracting `_ZL4g_fb`, `_ZL17g_kb_col_row_mask`, `_ZL5g_ovk`, and `tuh_hid_report_received_cb` in < 1 ms.
+  2. *In-Flash Signature Scanning:* If only raw UF2 flash data is supplied, the engine scans the flash image for invariant opcode and literal pool signatures.
+  3. *Fallback / User Override:* If symbols cannot be discovered, defaults are used (`0x2002_2900`), and users can override explicitly via `--fb-addr <ADDR>`.
 - **Extraction Mechanism:** Each simulated frame quantum, `extract_frame()` reads 32-bit words from SRAM offset, unpacking them into a host-side array of $320 \times 240$ 16-bit RGB565 pixels (153,600 bytes).
 - **SDL2 Presentation:** The extracted frame locks an SDL2 streaming texture (`PixelFormatEnum::RGB565`), presenting it on a centered $640 \times 480$ window at 60 Hz.
 - **Headless Mode (`--headless`):** Initializes an invisible window and bypasses frame presentation, enabling rapid continuous integration testing and automated regression benchmarks.
@@ -351,9 +354,9 @@ Host SDL2 Window / Non-blocking Terminal Stdin
          |                       |
          v                       v
 Tier 1: Matrix Engine   Tier 2: TinyUSB HID Callback
-  * SRAM 0x2000B1FC       * Report at 0x20060438
+  * SRAM 0x2000B304       * Report at 0x2001C18C
   * kt_chord() Table      * Trampoline at 0x2007FFE0
-  * Virtual Hold (4f*T)   * HID Callback 0x1001E7C0
+  * Virtual Hold (4f*T)   * HID Callback 0x1001F460
   * Virtual Gap (2f*T)    * Register Save / Restore
   * Boot Gated (630M cyc) * Direct Menu Navigation
          |                       |
@@ -361,8 +364,8 @@ Tier 1: Matrix Engine   Tier 2: TinyUSB HID Callback
 Guest 6809 Color BASIC   Firmware OSD Overlays (F1-F12)
 ```
 
-#### Tier 1: Direct Keyboard Matrix Injection (`0x2000_B1FC`)
-- **Matrix Interface Specification:** Injects active-low column/row bitmasks into `g_kb_col_row_mask` (8 columns × 7 rows) at SRAM address `0x2000_B1FC`, directly driving the MC6821 PIA0 keyboard scanning interface.
+#### Tier 1: Direct Keyboard Matrix Injection (`0x2000_B304`)
+- **Matrix Interface Specification:** Injects active-low column/row bitmasks into `g_kb_col_row_mask` (8 columns × 7 rows) at SRAM address `0x2000_B304`, directly driving the MC6821 PIA0 keyboard scanning interface.
 - **Chording Translation Contract (`kt_chord`):** Maps ASCII character sequences to native CoCo `dscan` matrix intersections, synthesizing automatic Shift chords for standard punctuation and symbols (`!`, `"`, `#`, `$`, `%`, `&`, `'`, `(`, `)`, `*`, `+`, `<`, `=`, `>`, `?`, `[`, `]`, `\`, `_`).
 - **Critical Timing Decision — Debounce Invariance:** Color BASIC's keyboard polling loop executes software debouncing that discards single-frame key pulses. Keystrokes are held asserted for 4 virtual frames (~66.7 ms at 60 Hz) and separated by a 2 virtual frame release gap (~33.3 ms). To guarantee reliable key latching under all emulation speeds, both durations are dynamically scaled by `--turbo` ($4 \times T$ and $2 \times T$), keeping virtual machine debouncing strictly invariant.
 - **Boot Readiness Tradeoff:** During the initial ~2.5 seconds of system boot, Color BASIC wipes and resets zero-page memory and input buffers. Keystroke dequeuing is gated until simulated cycle count reaches 630,000,000 cycles, preventing early keystrokes from being destroyed.
@@ -370,10 +373,10 @@ Guest 6809 Color BASIC   Firmware OSD Overlays (F1-F12)
 
 #### Tier 2: TinyUSB HID Callback Injection (`inject_hid_keycode`)
 The firmware's on-screen display (OSD) overlay system does not poll the keyboard matrix; it listens strictly for USB HID keyboard reports dispatched from TinyUSB host callbacks.
-- **Interface Contract:** Synthesizes standard 8-byte USB HID keyboard reports (`[modifier, reserved, keycode, ...]`) and invokes the firmware's TinyUSB HID report callback at `0x1001_E7C0` directly within Core 0.
+- **Interface Contract:** Synthesizes standard 8-byte USB HID keyboard reports (`[modifier, reserved, keycode, ...]`) in dedicated upper scratch SRAM (`TRAMP_ADDR - 0x10 = 0x2007_FFD0`) and invokes the firmware's TinyUSB HID report callback at `0x1001_F460` (or dynamically discovered address) directly within Core 0.
 - **State Preservation Contract:** HID report delivery executes atomically with full register state preservation (`R0–R14`, `xPSR`, `MSP`), ensuring zero disruption to running 6809 emulation or multi-core CPU state.
 - **Dynamic Routing Decision & State Isolation:**
-  - The emulator actively monitors the firmware's menu activation flag (`MENU_ACTIVE_ADDR = 0x2001_2938`).
+  - The emulator actively monitors the firmware's menu activation flag (`MENU_ACTIVE_ADDR = 0x2000_C8D0`).
   - *Normal Mode (`MENU_ACTIVE_ADDR == 0`):* Alphanumeric and symbol keys route exclusively to Tier 1 (Matrix Engine) to drive Color BASIC.
   - *Menu Active Mode (`MENU_ACTIVE_ADDR != 0`):* Host navigation keys (`Up`, `Down`, `PageUp`, `PageDown`, `Left`, `Right`, `Return`, `Escape`, `Tab`) and drive keys (`0`–`3`) are intercepted and routed to Tier 2 (HID Callback). This prevents menu navigation keystrokes from leaking into the Color BASIC input queue and guarantees immediate menu responsiveness.
 
@@ -390,7 +393,7 @@ To accommodate macOS and compact laptop keyboards where physical Function keys a
 | **Artifact Toggle** | **F8** | **Cmd+A** / **Ctrl+A** | `0x41` | PMODE 4 NTSC Color Cycle |
 
 #### Active Overlay Navigation Routing
-When an OSD menu overlay is open (`MENU_ACTIVE_ADDR = 0x2001_2938 != 0`):
+When an OSD menu overlay is open (`MENU_ACTIVE_ADDR = 0x2000_C8D0 != 0`):
 - Navigation keys are automatically intercepted and routed to Tier 2 HID reports:
   - `Up` (`0x52`), `Down` (`0x51`), `PageUp` (`0x4B`), `PageDown` (`0x4E`)
   - `Left` (`0x50`), `Right` (`0x4F`)

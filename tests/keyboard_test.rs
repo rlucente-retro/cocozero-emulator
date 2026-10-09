@@ -17,7 +17,6 @@ fn test_type_command_in_basic() {
 
     let mut soc = CoCoZeroSoC::new(storage).expect("Failed to create SoC");
     soc.load_bootrom(&std::fs::read("roms/rp2350/bootrom-combined.bin").expect("bootrom"));
-    soc.fb_addr = Some(0x2002_2794);
 
     let uf2_data = std::fs::read("roms/cocozero.uf2").expect("Failed to read cocozero.uf2");
     let flash = parse_uf2(&uf2_data).expect("Failed to parse UF2");

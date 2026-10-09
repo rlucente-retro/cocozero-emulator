@@ -6,6 +6,7 @@ pub mod frontend;
 pub mod interconnect;
 pub mod soc;
 pub mod keyboard;
+pub mod symbols;
 
 
 

@@ -13,7 +13,6 @@ fn test_menu_activation() {
 
     let mut soc = CoCoZeroSoC::new(storage).expect("Failed to create SoC");
     soc.load_bootrom(&std::fs::read("roms/rp2350/bootrom-combined.bin").expect("bootrom"));
-    soc.fb_addr = Some(0x2002_2794);
 
     let uf2_data = std::fs::read("roms/cocozero.uf2").expect("Failed to read cocozero.uf2");
     let flash = parse_uf2(&uf2_data).expect("Failed to parse UF2");
@@ -36,7 +35,7 @@ fn test_menu_activation() {
     assert_eq!(soc.get_menu_mode(), 0, "Menu mode should be 0 (Disks)");
 
     // Verify that the disk directory scan populated ZORK1.DSK
-    let disk_count = soc.emu.bus.read32(0x2001_49DC, 0);
+    let disk_count = soc.emu.bus.read32(soc.symbols.menu_count_addr, 0);
     assert_eq!(disk_count, 1, "SD directory scan should find 1 disk image");
 
     // Step 5 frames to let Core 0 render the menu
