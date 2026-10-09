@@ -2,8 +2,9 @@
 
 **Target Platform:** Waveshare RP2350-PiZero  
 **Emulated System:** Tandy Color Computer 2 (CoCo 2) with selective CoCo 3 enhancements  
-**Reference Implementation:** [ugufru/xroar-waveshare-rp2350-pizero](https://github.com/ugufru/xroar-waveshare-rp2350-pizero)  
-**Document Version:** 1.1.0  
+**Reference Firmware:** [ugufru/xroar-waveshare-rp2350-pizero](https://github.com/ugufru/xroar-waveshare-rp2350-pizero)  
+**Host Hardware Emulator:** `cocozero-rp2350` (Rust / SDL2 / `rp2350-emu`)  
+**Document Version:** 1.2.0  
 **Status:** Validated Technical Specification & System Reference  
 
 ---
@@ -12,32 +13,37 @@
 
 The **CoCo Zero** is a standalone, bare-metal hardware implementation of a Tandy Color Computer 2 (Dragon 32/64 compatible) built on a Raspberry Pi Zero form-factor microcontroller board—the **Waveshare RP2350-PiZero**. The device requires only a digital display (TV or monitor), a USB-C keyboard or gamepad, a standard 5V USB-C power source (or 3.7V Li-Po battery), and a FAT32-formatted microSD card containing Color BASIC ROMs.
 
+In addition to bare-metal microcontroller operation, this repository provides **`cocozero-rp2350`**, a full-system hardware emulator written in Rust that models the RP2350B microcontroller (dual Cortex-M33, SIO TMDS, SPI1 SD, Boot ROM, and UART0) executing the unmodified bare-metal CoCo Zero firmware.
+
 The system delivers:
 - **Locked 60.0 fps real-time emulation** of the Motorola MC6809E CPU, MC6883 Synchronous Address Multiplexer (SAM), dual MC6821 Peripheral Interface Adapters (PIAs), and MC6847 Video Display Generator (VDG).
-- **Combined video and digital audio over a single mini HDMI/DVI connector** via custom PIO-driven TMDS encoding with DVI/HDMI Data Island packets.
+- **Combined video and digital audio over a single mini HDMI/DVI connector** via custom PIO-driven TMDS encoding with DVI/HDMI Data Island packets (presented via SDL2 at 640×480 @ 60 Hz on host).
 - **Three-voice SN76489 Complex Sound Generator** (Games Master Cartridge sound chip) mixed with native 6-bit DAC audio.
-- **USB Host input** for standard USB HID keyboards (with US-keycap matrix translation and auto-repeat) and gamepads (decoded into dual analog joysticks and mapped fire buttons).
+- **USB Host input** for standard USB HID keyboards (with US-keycap matrix translation, auto-repeat, and cross-platform function/Command key shortcuts) and gamepads.
 - **Comprehensive on-screen display (OSD) overlay system** providing disk mounting, program launching, cartridge selection, on-screen settings text editing, and system diagnostics.
 - **Configuration and autorun engine** driven by plain-text files on SD card (`settings.txt`, `autorun.txt`, and per-game override files).
+- **Virtual FAT32 storage engine** capable of dynamically packaging a host directory into an in-memory FAT32 microSD image or mounting raw `.img` files, with full SPI read/write command support (`CMD0`–`CMD59`).
 - **Custom 3D-printable two-piece enclosure** faithfully styled after the ventilated chassis of an original Tandy Color Computer 2.
 
 ```
 +--------------------------------------------------------------------------+
-|                               CoCo Zero                                  |
+|                  CoCo Zero / RP2350B Execution Model                     |
 |                                                                          |
 |  +--------------------+    +--------------------+    +----------------+  |
-|  |     Core 0 (Host)  |    |    Core 1 (Video)  |    |  MicroSD Card  |  |
-|  |  * 6809/SAM/PIA/VDG|    |  * libdvi Scanout  |    |  * ROMs        |  |
-|  |  * USB Host (PIO1) |    |  * Hardware TMDS   |    |  * DSK Images  |  |
-|  |  * SD FatFS Access |    |  * Audio Islands   |    |  * BIN / CCC   |  |
-|  |  * VDG Frame Blit  |    |  * SIO Encoder     |    |  * Settings    |  |
-|  |  * Audio Resampler |    |  * Active DMA IRQ  |    |  * Screenshots |  |
+|  |     Core 0 (Host)  |    |    Core 1 (Video)  |    |  MicroSD SPI1  |  |
+|  |  * 6809/SAM/PIA/VDG|    |  * libdvi Scanout  |    |  * ROMs / DSK  |  |
+|  |  * USB Host / Matrix|   |  * Hardware TMDS   |    |  * FatFS Access|  |
+|  |  * OSD Menu Engine |    |  * Audio Islands   |    |  * Virtual     |  |
+|  |  * SD FatFS Access |    |  * SIO Encoder     |    |    FAT32 Img   |  |
+|  |  * VDG Frame Blit  |    |  * Multicore FIFO  |    |  * Sector Read/|  |
+|  |  * Audio Resampler |    |  * Active DMA IRQ  |    |    Write (CMD) |  |
 |  +---------+----------+    +---------+----------+    +-------+--------+  |
 |            |                         |                       |           |
 |            +-----------+-------------+                       |           |
 |                        |                                     |           |
-|         Mini DVI / HDMI Video + Audio Out             MicroSD SPI1 Slot  |
-|         USB-C Host Input (Keyboard / Pad)             USB-C Power/Serial |
+|  Physical Hardware:    Mini DVI/HDMI Out, USB Host, SPI1     MicroSD Slot|
+|  Host Emulator:        SDL2 640x480 @ 60Hz, AudioQueue,      Virtual SD /|
+|                        Dual-Tier Matrix/HID Input, UART0     ./coco/ Dir |
 +--------------------------------------------------------------------------+
 ```
 
@@ -116,6 +122,26 @@ The board features a 40-pin 2.54mm pitch dual-row expansion header matching the 
 
 > [!IMPORTANT]
 > **HSTX Serializer Incompatibility:** The RP2350 silicon incorporates a dedicated hardware high-speed serializer (HSTX). However, HSTX outputs are hardwired strictly to **GPIO 12 through GPIO 19**. Because the Waveshare RP2350-PiZero wires the mini video connector to **GPIO 32 through GPIO 39**, HSTX is electrically unreachable. Consequently, video generation must be executed entirely via PIO state machines using `libdvi` with `pio_set_gpio_base(pio, 16)`.
+
+### 2.6 Host RP2350B Hardware Emulator Architecture (`cocozero-rp2350`)
+
+The host emulator models the physical RP2350B microcontroller SoC through modular Rust crates (`rp2350-emu` and `cocozero-rp2350`), executing the bare-metal firmware without modification:
+- **Dual Cortex-M33 Execution Engine:** Dual cores executed in round-robin quantum slices (`step_quantum = 512` cycles). Cores feature complete Thumb-2 instruction sets, MPU, NVIC interrupt controller, SysTick timers, and inter-core memory barrier synchronization.
+  - *Granularity Tradeoff:* A 512-cycle quantum balances host CPU execution efficiency against fine-grained inter-core FIFO and SIO interaction fidelity.
+- **Boot ROM & Multicore Handshake:**
+  - Loads authentic RP2350 Boot ROM (`roms/rp2350/bootrom-combined.bin`).
+  - Core 1 initiates in a low-power `WFE` (Wait For Event) wait state until Core 0 executes the official Pico SDK multicore launch sequence via SIO FIFO.
+  - *Security Canary Decision:* The emulator pre-populates atomic canary salt registers (`rcp_salt_set(0, 0xCAFE_BABE)`, `rcp_salt_set(1, 0xDEAD_BEEF)`). Without this initialization, Core 1's Boot ROM monitor rejects Core 0's multicore wakeup signal and remains permanently in `WFE`, halting video and scanout generation.
+  - When booting UF2 directly without Boot ROM, the emulator initializes Core 0 vector registers directly from the Flash image vector table (`initial_sp` and `entry_point`).
+- **SIO (Single-Cycle I/O) Subsystem Emulation:**
+  - **Hardware TMDS Encoder:** Emulates RP2350 SIO hardware TMDS encoder registers (`TMDS_CTRL`, `TMDS_WDATA`, `TMDS_PEEK_SINGLE`), accelerating 3-lane RGB565 scanline encoding.
+  - **Multicore FIFO:** Models the bi-directional 8-deep FIFO (`FIFO_ST`, `FIFO_WR`, `FIFO_RD`) with automatic NVIC cross-core IRQ pending generation.
+  - **GPIO Output Registers:** Monitors `GPIO_HI_OUT` bit 11 (GPIO 43) to track software Chip Select assertions for the MicroSD controller.
+- **Memory Bus Dispatcher:** 520 KB unified on-chip SRAM (`0x2000_0000..0x2008_2000`) with mirror alias decoding, 16 MB QSPI NOR Flash (`0x1000_0000..0x1100_0000`), PPB, and Boot RAM.
+- **Simulation Turbo Multiplier (`--turbo <N>`):**
+  - Scales the per-frame virtual cycle slice: $\text{Cycles per frame} = \frac{252,000,000 / 60}{N}$.
+  - *Performance Tradeoff:* Simulating 252,000,000 cycles/sec across dual cores in software can exceed real-time budgets on host CPUs. At `--turbo 6`, virtual frame execution achieves real-time 60.0 FPS on standard desktop and laptop processors.
+  - *Timing Invariance:* Internal keyboard matrix debouncing, hold countdowns, and gap delays are dynamically multiplied by $N$, preserving correct virtual-time latching inside Color BASIC.
 
 ---
 
@@ -204,6 +230,14 @@ By setting the system clock to **252.000 MHz** and operating with a **25.200 MHz
 - **`6847t2` (Default):** Enhanced character set providing true lowercase permanently, true ASCII caret `^`, true underscore `_`, and full braces `{`, `|`, `}`, `~`.
 - **`lowercase = on` (Default):** Overrides Color BASIC's automatic prompt resets, maintaining lowercase display active even after `PRINT` statements and prompt redrawing.
 
+### 3.5 Host Emulator Display Pipeline & Framebuffer Extraction
+
+The host emulator bridges RP2350 SRAM video generation to modern host display servers using SDL2:
+- **Framebuffer Discovery:** Default framebuffer is located at SRAM address `0x2002_2744`. If relocations occur, `detect_framebuffer()` executes a heuristic scan across SRAM (`0x2000_0000..0x2008_0000`) in 1 KB increments searching for active RGB565 raster data. Users can override this explicitly via `--fb-addr <ADDR>`.
+- **Extraction Mechanism:** Each simulated frame quantum, `extract_frame()` reads 32-bit words from SRAM offset, unpacking them into a host-side array of $320 \times 240$ 16-bit RGB565 pixels (153,600 bytes).
+- **SDL2 Presentation:** The extracted frame locks an SDL2 streaming texture (`PixelFormatEnum::RGB565`), presenting it on a centered $640 \times 480$ window at 60 Hz.
+- **Headless Mode (`--headless`):** Initializes an invisible window and bypasses frame presentation, enabling rapid continuous integration testing and automated regression benchmarks.
+
 ---
 
 ## 4. Audio Subsystem Specification
@@ -249,6 +283,12 @@ To prevent long-term buffer underrun (audio drops) or overrun (lost packets):
 | **Native 6-bit DAC** | Resistor ladder DAC | PIA1 Port A (`$FF20`) | Level tracked on every PIA write; resampled via integrate-and-dump filter into 48 kHz 16-bit signed mono stream. |
 | **1-Bit Cassette Audio** | Single-bit flip-flop | PIA1 Port B Bit 3 (`$FF22`) | Cassette sound output mixed into DAC audio path. |
 | **SN76489 CSG** | 4-channel sound generator | `$FF41` (or GMC cart `$FF40–$FF5F`) | 3 square wave tone generators + 1 noise generator (white/periodic). Integrated into 48 kHz stream; global volume attenuation (0–15, default 10). |
+
+### 4.4 Host Emulator Audio Subsystem
+
+In the host emulator, digital audio is routed to host speakers through the SDL2 audio pipeline:
+- **Audio Queue Specification:** Configured for 48,000 Hz sample rate, 2-channel stereo, 16-bit signed integer format (`AudioFormat::S16LSB`), and a 1,024-sample hardware buffer.
+- **Latency & Overflow Protection:** The host queue enforces a bounded maximum size ($48,000 \times 2 \times 2\text{ bytes}$) to discard stale frames and maintain low audio latency across long execution sessions.
 
 ---
 
@@ -298,7 +338,66 @@ USB Key Event (HID Usage + Shift State)
 - **Keyboard Auto-Repeat:** Hardware-assisted auto-repeat (`key_repeat = on`, default 500 ms delay, 10 repeats/sec clamped to max 12/sec for BASIC input queue stability).
 - **Serial CDC Keyboard (`serial_keyboard = on`):** Characters received over USB-CDC are translated and queued directly into the virtual keyboard matrix. *Note: Color BASIC input routines require a brief settling delay between Enter and the next character; scripts should prefix lines with a leading space.*
 
-### 5.3 USB Gamepad Subsystem
+### 5.3 Host Emulator Dual-Tier Input Subsystem (`frontend.rs` & `keyboard.rs`)
+
+Because the host emulator executes the unaltered bare-metal RP2350 firmware, input must satisfy two distinct consumer layers: (1) guest 6809 Color BASIC running inside XRoar, which polls the virtual hardware keyboard matrix, and (2) the firmware's on-screen display (OSD) overlay menus, which listen for USB HID reports from TinyUSB host callbacks. The emulator implements a **dual-tier input architecture**:
+
+```
+Host SDL2 Window / Non-blocking Terminal Stdin
+                     |
+         +-----------+-----------+
+         |                       |
+[Normal Typing Mode]    [Function Keys & Menu Active]
+         |                       |
+         v                       v
+Tier 1: Matrix Engine   Tier 2: TinyUSB HID Callback
+  * SRAM 0x2000B1AC       * Report at 0x200603E8
+  * kt_chord() Table      * Trampoline at 0x2007FFE0
+  * Virtual Hold (4f*T)   * HID Callback 0x1001E784
+  * Virtual Gap (2f*T)    * Register Save / Restore
+  * Boot Gated (630M cyc) * Direct Menu Navigation
+         |                       |
+         v                       v
+Guest 6809 Color BASIC   Firmware OSD Overlays (F1-F12)
+```
+
+#### Tier 1: Direct Keyboard Matrix Injection (`0x2000_B1AC`)
+- **Matrix Interface Specification:** Injects active-low column/row bitmasks into `g_kb_col_row_mask` (8 columns × 7 rows) at SRAM address `0x2000_B1AC`, directly driving the MC6821 PIA0 keyboard scanning interface.
+- **Chording Translation Contract (`kt_chord`):** Maps ASCII character sequences to native CoCo `dscan` matrix intersections, synthesizing automatic Shift chords for standard punctuation and symbols (`!`, `"`, `#`, `$`, `%`, `&`, `'`, `(`, `)`, `*`, `+`, `<`, `=`, `>`, `?`, `[`, `]`, `\`, `_`).
+- **Critical Timing Decision — Debounce Invariance:** Color BASIC's keyboard polling loop executes software debouncing that discards single-frame key pulses. Keystrokes are held asserted for 4 virtual frames (~66.7 ms at 60 Hz) and separated by a 2 virtual frame release gap (~33.3 ms). To guarantee reliable key latching under all emulation speeds, both durations are dynamically scaled by `--turbo` ($4 \times T$ and $2 \times T$), keeping virtual machine debouncing strictly invariant.
+- **Boot Readiness Tradeoff:** During the initial ~2.5 seconds of system boot, Color BASIC wipes and resets zero-page memory and input buffers. Keystroke dequeuing is gated until simulated cycle count reaches 630,000,000 cycles, preventing early keystrokes from being destroyed.
+- **Input Stream Multiplexing:** Accepts input concurrently from both the graphical SDL2 window (`TextInput` with `KeyDown` fallback) and a non-blocking background host terminal `stdin` thread.
+
+#### Tier 2: TinyUSB HID Callback Injection (`inject_hid_keycode`)
+The firmware's on-screen display (OSD) overlay system does not poll the keyboard matrix; it listens strictly for USB HID keyboard reports dispatched from TinyUSB host callbacks.
+- **Interface Contract:** Synthesizes standard 8-byte USB HID keyboard reports (`[modifier, reserved, keycode, ...]`) and invokes the firmware's TinyUSB HID report callback at `0x1001_E784` directly within Core 0.
+- **State Preservation Contract:** HID report delivery executes atomically with full register state preservation (`R0–R14`, `xPSR`, `MSP`), ensuring zero disruption to running 6809 emulation or multi-core CPU state.
+- **Dynamic Routing Decision & State Isolation:**
+  - The emulator actively monitors the firmware's menu activation flag (`MENU_ACTIVE_ADDR = 0x2001_28E8`).
+  - *Normal Mode (`MENU_ACTIVE_ADDR == 0`):* Alphanumeric and symbol keys route exclusively to Tier 1 (Matrix Engine) to drive Color BASIC.
+  - *Menu Active Mode (`MENU_ACTIVE_ADDR != 0`):* Host navigation keys (`Up`, `Down`, `PageUp`, `PageDown`, `Left`, `Right`, `Return`, `Escape`, `Tab`) and drive keys (`0`–`3`) are intercepted and routed to Tier 2 (HID Callback). This prevents menu navigation keystrokes from leaking into the Color BASIC input queue and guarantees immediate menu responsiveness.
+
+#### Function Keys & Cross-Platform Shortcuts
+To accommodate macOS and compact laptop keyboards where physical Function keys are captured by the operating system for brightness or volume:
+
+| Target Function | Standard Key | macOS / PC Shortcut | HID Code | Target Subsystem |
+|---|---|---|---|---|
+| **Disks Menu** | **F12** | **Cmd+D** / **Ctrl+D** | `0x45` | OSD Floppy Disk Mount (`< DISKS >`) |
+| **Programs Menu** | **F9** | **Cmd+P** / **Ctrl+P** | `0x42` | OSD Binary Launcher (`< PROGRAMS >`) |
+| **Cartridges Menu** | **F10** | **Cmd+C** / **Ctrl+C** | `0x43` | OSD Cartridge Selector (`< CARTRIDGES >`) |
+| **Files Menu** | **F11** | *N/A* | `0x44` | OSD Text Editor (`< FILES >`) |
+| **Info / Telemetry** | **F1** | **Cmd+I** / **Ctrl+I** | `0x3A` | OSD System Diagnostics (`< INFO >`) |
+| **Artifact Toggle** | **F8** | **Cmd+A** / **Ctrl+A** | `0x41` | PMODE 4 NTSC Color Cycle |
+
+#### Active Overlay Navigation Routing
+When an OSD menu overlay is open (`MENU_ACTIVE_ADDR = 0x2001_28E8 != 0`):
+- Navigation keys are automatically intercepted and routed to Tier 2 HID reports:
+  - `Up` (`0x52`), `Down` (`0x51`), `PageUp` (`0x4B`), `PageDown` (`0x4E`)
+  - `Left` (`0x50`), `Right` (`0x4F`)
+  - `Return` / `KpEnter` (`0x28`), `Escape` (`0x29`), `Tab` (`0x2B`)
+- Drive selection keys: `0`, `1`, `2`, `3` on main keyboard or keypad are routed to HID keycodes `0x27`, `0x1E`, `0x1F`, `0x20` to mount or unmount floppy drives live.
+
+### 5.4 USB Gamepad Subsystem
 
 The firmware auto-detects and decodes multiple standard gamepad protocols:
 1. **Sony DualShock 4** (VID `0x054C`, PID `0x09CC`)
@@ -352,13 +451,48 @@ The loader searches for ROMs first in `/coco/roms/<name>` and falls back to `/co
 - **`extbas11.rom` Missing:** System displays `MSG_CBONLY` notice ("COLOR BASIC ONLY") for 4.0 seconds, then boots into Color BASIC 1.2 with 16 KB RAM ($A000–$BFFF and $E000–$FFFF). Disk commands will not be available.
 - **MicroSD Card Unreadable:** System displays `MSG_NOSD` splash screen.
 
-### 6.2 Floppy Disk Controller (FDC) Emulation
+### 6.2 MicroSD SPI Controller & Virtual FAT32 Storage Engine (`spi_sd.rs` & `fat32.rs`)
+
+The host emulator provides two interchangeable storage backends:
+1. **Dynamic Virtual FAT32 Builder (`src/fat32.rs`):** When launched pointing to a directory (`--sd ./coco`), the emulator dynamically synthesizes a complete FAT32 filesystem in memory (`MemoryStorage`). It generates the Master Boot Record (MBR), FAT32 Volume Boot Record (VBR / BPB), FSInfo sector, two 32-bit FAT tables, the root directory cluster, subdirectories (`roms/`, `dsk/`, `cart/`, `bin/`, `shots/`), contiguous cluster chains, and authentic 8.3 directory entries on the fly.
+2. **File-Backed Storage (`FileStorage`):** When launched pointing to a raw disk image file (`--sd sdcard.img`), sectors are read and written directly to the host image file.
+
+#### SPI1 SD Card Controller Emulation
+The firmware communicates with the SD card via SPI1 using software Chip Select on GPIO 43. The emulator implements a complete SD Card SPI-mode protocol state machine (`SpiSdCard`):
+
+| SPI Command | Name | Arguments | Card Response | Description |
+|---|---|---|---|---|
+| **CMD0** | `GO_IDLE_STATE` | `0x00000000` | R1 (`0x01`) | Puts card into SPI idle state |
+| **CMD8** | `SEND_IF_COND` | `0x000001AA` | R7 (`0x01`, `0xAA`) | Checks voltage range & pattern echo |
+| **CMD9** | `SEND_CSD` | `0x00000000` | R1 (`0x00`) + Token `0xFE` + 16B | CSD v2.0 (SDHC capacity calculated from sectors) |
+| **CMD10** | `SEND_CID` | `0x00000000` | R1 (`0x00`) + Token `0xFE` + 16B | Card identification ("COCO0", serial, CRC) |
+| **CMD12** | `STOP_TRANSMISSION` | `0x00000000` | Stuff `0xFF`, R1 (`0x00`) | Terminates streaming multi-block read |
+| **CMD13** | `SEND_STATUS` | `0x00000000` | R2 (`[0x00, 0x00]`) | Returns 2-byte card operational status |
+| **CMD16** | `SET_BLOCKLEN` | `512` | R1 (`0x00`) | Sets block length (512 bytes) |
+| **CMD17** | `READ_SINGLE_BLOCK` | Sector index | R1 (`0x00`) + `0xFE` + 512B + CRC | Single sector payload streamed from backing store |
+| **CMD18** | `READ_MULTIPLE_BLOCK`| Sector index | R1 (`0x00`) + streaming blocks | Continuous multi-block sector stream |
+| **CMD24** | `WRITE_SINGLE_BLOCK`| Sector index | R1 (`0x00`), `0x05`, `0xFF` | Single sector write with data token & busy release |
+| **CMD25** | `WRITE_MULTIPLE_BLOCK`| Sector index | R1 (`0x00`), `0x05`, `0xFF` | Streaming multi-sector write terminated by `0xFD` |
+| **CMD55 + ACMD41**| `SD_SEND_OP_COND` | `0x40000000` | R1 (`0x00`) | Activates card initialization, transitions to Ready |
+| **CMD58** | `READ_OCR` | `0x00000000` | R1 (`0x00`) + OCR 4B | OCR register (CCS bit = 1, SDHC/SDXC supported) |
+| **CMD59** | `CRC_ON_OFF` | `0x00000000` | R1 (`0x00`) | Enables or disables CRC checking |
+
+#### Sector Write Contract & Critical Protocol Tradeoff
+- **Single-Block Write Contract (`CMD24`):** Following CMD24, the card expects Start Block Token `0xFE`, captures 512 sector payload bytes and 2 CRC bytes, commits the sector to backing storage, and returns Data Accepted Token `0x05` followed by Ready `0xFF`.
+- **Multi-Block Write Contract (`CMD25`):** Streams consecutive sectors delimited by Start Block Token `0xFC`, commits each sector, auto-increments the sector address, and cleanly terminates upon receiving Stop Tran Token `0xFD`.
+- **Card Status Query Contract (`CMD13`):** Returns standard 2-byte R2 status indicating operational readiness (`0x0000`).
+- **Critical Protocol Decision — SPI Stream Disambiguation:**
+  - *Context:* In SD SPI mode, standard command framing looks for bytes matching `01xxxxxx` (`(mosi & 0xC0) == 0x40`). However, sector write payloads (especially directory sectors containing uppercase ASCII filenames) frequently contain bytes that match this mask.
+  - *Contract:* The SD controller state machine strictly inhibits command framing whenever the card is in a data-receiving state (`WritingSingleBlock` or `WritingMultiBlock`). Command parsing is only re-enabled after block commit and busy-signaling completion.
+  - *Tradeoff Impact:* Without this disambiguation, FatFs directory rescans during OSD disk mounting mistake directory sector bytes for new commands, desynchronizing the SPI bus and causing disk cataloging to abort with false "NO DISK IMAGES FOUND" errors.
+
+### 6.3 Floppy Disk Controller (FDC) Emulation
 
 The system emulates a Western Digital **WD2797 / WD1793** Floppy Disk Controller mapped at `$FF48–$FF4B`:
 - **Virtual Drives:** 4 independent floppy disk drives (Drive 0, 1, 2, 3).
 - **Disk Image Format:** Standard unadorned single-sided `.dsk` files (typically 35 tracks, 18 sectors/track, 256 bytes/sector = 161,280 bytes).
 - **Drive Select Register ($FF40):** Monitored to detect guest drive switching.
-- **Read-Only Operation:** Current firmware mounts `.dsk` images read-only; write attempts return write-protect errors.
+- **Read-Only Operation in Guest:** Current guest floppy controller firmware mounts `.dsk` floppy images read-only inside the 6809 system (write attempts return write-protect errors). Conversely, host FatFs operations on the microSD card support both reads and writes.
 - **Drive Persistence:** Drive assignments are automatically preserved across power cycles in `/coco/drives.txt`.
 
 #### RS-DOS Directory Scanning (`rsdos_dir.h`)
@@ -368,7 +502,7 @@ When a disk is selected for launch in Drive 0:
 - Automatically generates the launch command (`RUN"NAME"\r` or `LOADM"NAME":EXEC\r`).
 - Queues command with a 180-frame (~3.0 s) warmup delay to allow Disk BASIC to initialize before typing.
 
-### 6.3 Cartridge & Binary Loading Engine
+### 6.4 Cartridge & Binary Loading Engine
 
 - **Direct Binary Loading (`.bin`):** Color BASIC `LOADM` binary parsing (`coco_boot_parse_loadm`). Loads multi-segment headers directly into RAM and executes via direct Program Counter (PC) jump without requiring Disk BASIC.
 - **ROM Cartridges (`.ccc`):**
@@ -428,15 +562,15 @@ The MC6883 SAM incorporates high-speed address decode modes (`POKE 65495,0` for 
 
 The OSD runs over a 32-column × 16-row character card rendered using the 6847T2 font. The running emulator pauses completely during overlay display.
 
-| Key | Overlay Menu | Description & Functionality |
-|---|---|---|
-| **F12** | **`< DISKS >`** | Displays available `.dsk` files. Keys **0–3** insert/eject the selected disk into virtual drive 0, 1, 2, or 3 live. **ENTER** mounts disk in drive 0, cold-boots the system, and auto-executes the disk's first program. |
-| **F9** | **`< PROGRAMS >`** | Displays `.bin` binary files in `/coco/bin/`. **ENTER** direct-loads the binary into RAM and jumps to the execution address. |
-| **F10** | **`< CARTRIDGES >`** | Displays `.ccc` cartridge images in `/coco/cart/`. **ENTER** attaches the cartridge and performs a cold reset into the cartridge. |
-| **F11** | **`< FILES >`** | Lists editable configuration files (`SETTINGS.TXT` and `AUTORUN.TXT`). **ENTER** opens the built-in text editor. |
-| **F1** | **`< INFO >`** | Displays system diagnostic telemetry: firmware version, git commit, RP2350 chip ID and revision, board unique serial ID, system clock, uptime, free heap memory, and attached USB devices. |
-| **F8** | *Artifact Cycle* | Directly cycles through NTSC artifact modes (`on` $\rightarrow$ `swapped` $\rightarrow$ `off`) and saves the setting for the current title. |
-| **PrtScn** | *Screenshot* | Captures the active $320 \times 240$ RGB565 display buffer, compresses it to PNG format, and writes it to `/coco/shots/`. |
+| Key | macOS / PC Shortcut | Overlay Menu | Description & Functionality |
+|---|---|---|---|
+| **F12** | **Cmd+D** / **Ctrl+D** | **`< DISKS >`** | Displays available `.dsk` files in `/coco/dsk/`. Keys **0–3** insert/eject the selected disk into virtual drive 0, 1, 2, or 3 live. **ENTER** mounts disk in drive 0, cold-boots the system, and auto-executes the disk's first program. |
+| **F9** | **Cmd+P** / **Ctrl+P** | **`< PROGRAMS >`** | Displays `.bin` binary files in `/coco/bin/`. **ENTER** direct-loads the binary into RAM and jumps to the execution address. |
+| **F10** | **Cmd+C** / **Ctrl+C** | **`< CARTRIDGES >`** | Displays `.ccc` cartridge images in `/coco/cart/`. **ENTER** attaches the cartridge and performs a cold reset into the cartridge. |
+| **F11** | *N/A* | **`< FILES >`** | Lists editable configuration files (`SETTINGS.TXT` and `AUTORUN.TXT`). **ENTER** opens the built-in text editor. |
+| **F1** | **Cmd+I** / **Ctrl+I** | **`< INFO >`** | Displays system diagnostic telemetry: firmware version, git commit, RP2350 chip ID and revision, board unique serial ID, system clock, uptime, free heap memory, and attached USB devices. |
+| **F8** | **Cmd+A** / **Ctrl+A** | *Artifact Cycle* | Directly cycles through NTSC artifact modes (`on` $\rightarrow$ `swapped` $\rightarrow$ `off`) and saves the setting for the current title. |
+| **PrtScn** | *N/A* | *Screenshot* | Captures the active $320 \times 240$ RGB565 display buffer, compresses it to PNG format, and writes it to `/coco/shots/`. |
 
 ### 8.2 Built-In On-Screen Text Editor (`text_editor.cpp` / `text_edit.h`)
 
@@ -505,6 +639,19 @@ Every second, Core 0 outputs performance and status telemetry over the USB-CDC s
 [run] fps=60.0 cpu=11024us blit=1612us aud=0us free_ram=127KB usb=1 hid_rpts=120 freezes=0
 ```
 
+### 9.3 Host Emulator Telemetry & Console Stream
+
+The emulator captures the RP2350's hardware UART0 controller, bridging internal firmware logs and runtime diagnostics to the host terminal:
+- **Live Console Output:** Every byte written to UART0 TX is printed directly to host `stdout` and appended to a synchronized internal log buffer (`serial_tx_log`).
+- **Dynamic Status Line:** Every simulated second, the emulator renders a real-time progress update over `stdout`:
+  ```text
+  [Emulating] Frame:   1520 | Virt-FPS:  60.1 | Core 0 PC: 0x10006BAC | Core 1 PC: 0x100220D8
+  ```
+- **Readiness Announcement:** When virtual cycles reach the Color BASIC boot readiness threshold (630,000,000 cycles), the console announces:
+  ```text
+  [System Ready] Color BASIC initialization complete! Ready for keyboard input.
+  ```
+
 ---
 
 ## 10. Physical Enclosure Specifications
@@ -539,7 +686,21 @@ The project is built using PlatformIO with the Earle F. Philhower, III Arduino-P
 | **`pizero_wdtest`** | 640×480p @ ~52 Hz | Streaming Data Islands | 240 MHz | Diagnostic: Forces Core 0 lockup to verify watchdog recovery. |
 | **`native`** | N/A | N/A | N/A | Host Unit Tests: 16 test suites (222 test cases) executed on host PC via Unity. |
 
-### Critical Compiler & Toolchain Constraints
+### 11.2 Host Emulator Build Environment (`cocozero-rp2350`)
+
+The host emulator is implemented in Rust (2024 edition) and built via Cargo:
+- **Workspace Architecture:**
+  - `cocozero-rp2350`: Top-level binary application and integration library (`src/`).
+  - `crates/rp2350-emu`: Standalone RP2350B hardware microcontroller emulation core (`crates/rp2350-emu/`).
+- **Dependencies:**
+  - `sdl2` (v0.38): Window management, RGB565 streaming texture rendering, event pump, and 48 kHz audio queue.
+  - `clap` (v4.5): Command-line argument parsing with derive macros.
+  - `byteorder` (v1.5) & `crc` (v3.2): Binary serialization and CRC checksum calculation.
+- **Build Configurations:**
+  - Development: `cargo build` / `cargo test`
+  - Production (Optimized): `cargo build --release` (`opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `panic = "abort"`).
+
+### 11.3 Critical Compiler & Toolchain Constraints (Firmware)
 
 1. **`PICO_NO_HARDWARE` Macro Trap:** In the arduino-pico core, `PICO_NO_HARDWARE` is defined as `0`. Standard SDK macros like `__not_in_flash_func()` evaluate `#if defined(PICO_NO_HARDWARE)` as true, silently causing critical time-sensitive functions to remain in flash memory. All time-critical interrupt handlers and encoders must use explicit section attributes:
    ```c
@@ -551,9 +712,11 @@ The project is built using PlatformIO with the Earle F. Philhower, III Arduino-P
 
 ---
 
-## 12. Host Unit Test Coverage
+## 12. Test Coverage & Verification Suites
 
-The firmware architecture isolates pure emulation, parsing, and data manipulation logic into header-only modules tested under `platform = native`:
+### 12.1 Reference Firmware Unity Unit Tests
+
+The C/C++ firmware architecture isolates pure emulation, parsing, and data manipulation logic into header-only modules tested under `platform = native` via Unity:
 - `test_audio_servo`: Frequency error compensation and audio ring level servo.
 - `test_cart_gmc`: Bank-switched Games Master Cartridge address decoding.
 - `test_coco_palette`: RGB565 color palette lookup and GIME registers.
@@ -570,3 +733,62 @@ The firmware architecture isolates pure emulation, parsing, and data manipulatio
 - `test_text_card`: 32×16 OSD character grid formatting and text wrapping.
 - `test_text_edit`: On-screen text editor buffer manipulation and cursor movements.
 - `test_vdg_pack`: MC6847 VDG pixel bit-packing and font rendering.
+
+### 12.2 Host Emulator Rust Automated Test Suite (`cargo test`)
+
+The host emulator incorporates an extensive automated test suite executed via `cargo test --tests --release`:
+- **`tests/menu_test.rs`:** End-to-end integration test validating virtual FAT32 filesystem construction, boot to Color BASIC, F12 HID keycode injection, `/coco/dsk/` directory scanning (`ZORK1.DSK` verified with count = 1), menu overlay display rendering, Up/Down navigation, F1 Info mode activation, and Escape menu dismissal.
+- **`tests/keyboard_test.rs`:** Validates Color BASIC boot detection, virtual keyboard matrix chording, hold/gap timing countdowns, and command execution in Color BASIC.
+- **`tests/hardware_test.rs`:** Validates RP2350 SIO TMDS CPU execution and line doubling registers.
+- **`tests/screen_test.rs`:** Validates SRAM framebuffer discovery and RGB565 extraction.
+- **`tests/integration_test.rs`:** Validates full RP2350 SoC initialization and dual-core firmware execution.
+- **`tests/multicore_test.rs`:** Validates SIO FIFO inter-core messaging, concurrent FIFO exchanges, and Boot ROM Core 1 WFE parking.
+- **`tests/demo_test.rs`:** Validates UF2 image parsing and entry execution.
+- **`tests/trace_fault.rs`:** Validates CPU fault tracing and instruction stepping.
+- **Core Unit Tests (`src/lib.rs`):**
+  - `test_spi_sd_initialization_sequence`: Validates CMD0, CMD8, CMD55, and ACMD41 SPI state transitions.
+  - `test_spi_sd_block_read`: Validates CMD17 single-block read, `0xFE` token, 512-byte payload, and CRC16.
+  - `test_spi_sd_block_write`: Validates CMD24 single-block write, data tokens, sector commit to storage, and `0x05` response.
+  - `test_virtual_fat32_builder`: Validates in-memory FAT32 volume generation from a host directory hierarchy.
+  - `test_sio_tmds_rgb565_doubled`: Validates SIO hardware TMDS pixel encoding algorithms.
+  - `test_uf2_block_parsing`: Validates Microsoft UF2 flash block decoding.
+
+---
+
+## 13. Emulator Command-Line Interface & Operational Reference
+
+The `cocozero-rp2350` binary exposes a flexible CLI for interactive execution, development, and automated scripting:
+
+```text
+Usage: cocozero-rp2350 [OPTIONS]
+```
+
+### 13.1 Command-Line Options Matrix
+
+| Option | Flag | Type | Default | Description |
+|---|---|---|---|---|
+| `--turbo` | | `u32` | `2` | **Simulation speed multiplier.** Multiplies the virtual cycle quantum per frame. `--turbo 6` provides smooth 60.0 FPS real-time execution on typical desktop CPUs. |
+| `--sd` | `-s` | `Path` | `./coco` | Path to host directory to package into virtual FAT32, or path to a raw `.img` SD disk image. |
+| `--uf2` | `-u` | `Path` | `roms/cocozero.uf2` | Path to firmware UF2 binary. |
+| `--bin` | `-b` | `Path` | *None* | Path to raw firmware binary (`.bin`). |
+| `--bootrom` | | `Path` | `roms/rp2350/bootrom-combined.bin` | Path to RP2350 Boot ROM image. |
+| `--headless` | | `bool` | `false` | Run without an SDL2 GUI window (for automated testing and benchmarks). |
+| `--max-frames` | | `u64` | `0` | Terminate execution after $N$ frames (`0` = run indefinitely). |
+| `--fb-addr` | | `String` | `0x20022744` | Explicit override for framebuffer SRAM address (e.g. `0x20010000`). |
+| `--help` | `-h` | | | Print command-line help summary. |
+
+### 13.2 Common Operational Examples
+
+```bash
+# Standard interactive execution with real-time 60 FPS performance
+cargo run --release -- --turbo 6
+
+# Mount a custom external games directory as the virtual SD card
+cargo run --release -- --turbo 6 --sd /path/to/my_coco_folder
+
+# Headless smoke test executing 300 frames (~5 simulated seconds)
+cargo run --release -- --headless --max-frames 300 --turbo 6
+
+# Execute the complete automated regression test suite
+cargo test --tests --release
+```
