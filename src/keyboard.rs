@@ -1,14 +1,14 @@
 //! CoCo Zero Keyboard Matrix Emulation.
 //!
 //! Maps standard PC / USB keyboard keys and ASCII characters to the
-//! Tandy Color Computer 2 keyboard matrix (8 columns x 7 rows) at SRAM address `0x2000_b1ac`.
+//! Tandy Color Computer 2 keyboard matrix (8 columns x 7 rows) at SRAM address `0x2000_b1fc`.
 
 use rp2350_emu::bus::Bus;
 use sdl2::keyboard::Keycode;
 use std::collections::VecDeque;
 
 /// Physical SRAM address of `g_kb_col_row_mask` in the CoCo Zero firmware.
-pub const KB_MATRIX_ADDR: u32 = 0x2000_b1ac;
+pub const KB_MATRIX_ADDR: u32 = 0x2000_b1fc;
 
 // Scancodes as defined by XRoar's dkbd and key_translate.h
 pub const K_0: u8 = 0x00;

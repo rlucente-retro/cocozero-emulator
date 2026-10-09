@@ -67,7 +67,7 @@ impl CoCoZeroSoC {
             sd_card,
             serial_tx_log,
             serial_rx_queue: VecDeque::new(),
-            fb_addr: Some(0x2002_2744),
+            fb_addr: Some(0x2002_2794),
             frame_counter: 0,
             total_cycles: 0,
             keyboard_ready_forced: false,
@@ -209,7 +209,7 @@ impl CoCoZeroSoC {
 
     /// Extract the 320×240 RGB565 frame from SRAM for rendering.
     pub fn extract_frame(&mut self, out: &mut [u16; FB_PIXELS]) -> bool {
-        let addr = self.fb_addr.unwrap_or(0x2002_2744);
+        let addr = self.fb_addr.unwrap_or(0x2002_2794);
         let offset = addr.saturating_sub(0x2000_0000);
         let mem = &self.emu.bus.memory;
         for i in 0..(FB_PIXELS / 2) {
@@ -298,12 +298,12 @@ impl CoCoZeroSoC {
 }
 
 /// Physical SRAM address of menu active flag (1 = active, 0 = inactive).
-pub const MENU_ACTIVE_ADDR: u32 = 0x2001_28e8;
+pub const MENU_ACTIVE_ADDR: u32 = 0x2001_2938;
 /// Physical SRAM address of active menu mode (0 = Disks, 1 = Programs, 2 = Carts, 3 = Files, 4 = Info).
-pub const MENU_MODE_ADDR: u32 = 0x2004_a2b8;
+pub const MENU_MODE_ADDR: u32 = 0x2004_a308;
 /// Physical SRAM address of TinyUSB HID keyboard report buffer.
-pub const HID_REPORT_ADDR: u32 = 0x2006_03e8;
+pub const HID_REPORT_ADDR: u32 = 0x2006_0438;
 /// Entry point of TinyUSB host HID report callback in firmware flash.
-pub const HID_CB_ADDR: u32 = 0x1001_e784;
+pub const HID_CB_ADDR: u32 = 0x1001_e7c0;
 /// Scratch trampoline location in upper SRAM.
 pub const TRAMP_ADDR: u32 = 0x2007_ffe0;
