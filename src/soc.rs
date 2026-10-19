@@ -8,7 +8,9 @@
 //! - 520 KB SRAM with 320×240 RGB565 Framebuffer extraction
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::io::Write;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rp2350_emu::{Config, Emulator, EmulatorBuilder};
@@ -22,6 +24,7 @@ pub const SYS_CLK_HZ: u32 = 252_000_000;
 pub const FB_WIDTH: usize = 320;
 pub const FB_HEIGHT: usize = 240;
 pub const FB_PIXELS: usize = FB_WIDTH * FB_HEIGHT;
+pub const AUDIO_RING_SAMPLES: usize = 8192;
 
 pub struct CoCoZeroSoC {
     pub emu: Emulator,
@@ -34,6 +37,13 @@ pub struct CoCoZeroSoC {
     pub keyboard_ready_forced: bool,
     pub keyboard: KeyboardMatrix,
     pub symbols: FirmwareSymbols,
+    pub host_audio_r: u32,
+    pub audio_samples_drained: u64,
+    pub audio_lapped_samples: u64,
+    pub turbo: u32,
+    dc_x1: i32,
+    dc_y1: i64,
+    dc_initialized: bool,
 }
 
 impl CoCoZeroSoC {
@@ -76,6 +86,13 @@ impl CoCoZeroSoC {
             keyboard_ready_forced: false,
             keyboard: KeyboardMatrix::new(),
             symbols,
+            host_audio_r: 0,
+            audio_samples_drained: 0,
+            audio_lapped_samples: 0,
+            turbo: 1,
+            dc_x1: 0,
+            dc_y1: 0,
+            dc_initialized: false,
         })
     }
 
@@ -125,6 +142,11 @@ impl CoCoZeroSoC {
         // GPIO 43 is bit 11 in GPIO_HI_OUT (active low)
         let cs_asserted = (gpio_hi & (1 << (43 - 32))) == 0;
         self.sd_card.lock().unwrap().set_cs(cs_asserted);
+    }
+
+    /// Flush any pending dirty sectors in SD card storage back to host files.
+    pub fn flush_storage(&mut self) -> bool {
+        self.sd_card.lock().unwrap().flush()
     }
 
     /// Inject a character into UART0 serial console.
@@ -182,10 +204,11 @@ impl CoCoZeroSoC {
 
     /// Step by one frame quantum divided by turbo factor.
     pub fn step_frame_turbo(&mut self, turbo: u32) -> Result<(), String> {
+        let t = turbo.max(1);
+        self.turbo = t;
         let ready = self.is_keyboard_ready();
-        self.keyboard.sync_frame(&mut self.emu.bus, turbo, ready);
-        let t = turbo.max(1) as u64;
-        let cycles_per_frame = ((SYS_CLK_HZ / 60) as u64) / t;
+        self.keyboard.sync_frame(&mut self.emu.bus, t, ready);
+        let cycles_per_frame = ((SYS_CLK_HZ / 60) as u64) / (t as u64);
         self.step_cycles(cycles_per_frame)?;
         self.frame_counter += 1;
         Ok(())
@@ -197,7 +220,7 @@ impl CoCoZeroSoC {
             return Some(addr);
         }
 
-        // Look through SRAM (0x20000000..0x20080000) in 4KB steps
+        // Look through SRAM (0x20000000..0x20080000) in 1KB steps
         // Look for regions with non-zero color data
         let sram_base = 0x2000_0000u32;
         let sram_size = 520 * 1024;
@@ -233,6 +256,87 @@ impl CoCoZeroSoC {
             out[i * 2 + 1] = (val >> 16) as u16;
         }
         true
+    }
+
+    /// Extract pending audio samples from the firmware ring buffer.
+    ///
+    /// Drains mono 48 kHz 16-bit PCM samples produced by Core 0, duplicates
+    /// each sample into interleaved stereo pairs [L, R], advances the host read index,
+    /// and synchronizes g_audio_r in firmware SRAM.
+    pub fn extract_audio(&mut self) -> Vec<i16> {
+        let w_addr = self.symbols.audio_w_addr;
+        let ring_addr = self.symbols.audio_ring_addr;
+        let r_addr = self.symbols.audio_r_addr;
+        let ring_bytes = (AUDIO_RING_SAMPLES * 2) as u32;
+
+        // Ensure addresses and full ring span are within physical SRAM space (0x2000_0000..0x2008_2000)
+        if !(0x2000_0000..0x2008_2000).contains(&w_addr)
+            || ring_addr < 0x2000_0000
+            || ring_addr.saturating_add(ring_bytes) > 0x2008_2000
+        {
+            return Vec::new();
+        }
+
+        let w = self.emu.bus.memory.sram_read32(w_addr - 0x2000_0000);
+        let mut r = self.host_audio_r;
+        let mut avail = w.wrapping_sub(r);
+
+        // If producer lapped reader, skip ahead to avoid reading stale or overwritten slots
+        if avail > AUDIO_RING_SAMPLES as u32 {
+            let lapped = avail - AUDIO_RING_SAMPLES as u32;
+            self.audio_lapped_samples += lapped as u64;
+            r = w.wrapping_sub(AUDIO_RING_SAMPLES as u32);
+            avail = AUDIO_RING_SAMPLES as u32;
+        }
+
+        if avail == 0 {
+            return Vec::new();
+        }
+
+        self.audio_samples_drained += avail as u64;
+        let turbo_factor = self.turbo.max(1) as usize;
+        let mut out = Vec::with_capacity((avail as usize) * 2 * turbo_factor);
+        while r != w {
+            let ring_idx = (r as usize) & (AUDIO_RING_SAMPLES - 1);
+            let sample_addr = ring_addr + (ring_idx as u32) * 2;
+            let raw_sample = self.emu.bus.memory.sram_read16(sample_addr - 0x2000_0000) as i16;
+            let x = raw_sample as i32;
+
+            if !self.dc_initialized {
+                self.dc_x1 = x;
+                self.dc_y1 = 0;
+                self.dc_initialized = true;
+            }
+
+            // Single-pole DC blocker (high-pass filter, fc ≈ 5 Hz at 48 kHz):
+            // Removes resting DAC DC offsets (e.g. resting -1920) so idle BASIC is pure silence.
+            let decay = (self.dc_y1 * (32768 - 32746)) / 32768;
+            let decay = if decay == 0 && self.dc_y1 != 0 {
+                if self.dc_y1 > 0 { 1 } else { -1 }
+            } else {
+                decay
+            };
+            let y = ((x as i64 - self.dc_x1 as i64) << 8) + self.dc_y1 - decay;
+            self.dc_x1 = x;
+            self.dc_y1 = y;
+            let sample = ((y + 128) >> 8).clamp(-32768, 32767) as i16;
+
+            for _ in 0..turbo_factor {
+                // Duplicate mono to stereo [L, R]
+                out.push(sample);
+                out.push(sample);
+            }
+            r = r.wrapping_add(1);
+        }
+
+        self.host_audio_r = w;
+
+        // Synchronize g_audio_r in SRAM so firmware telemetry reflects current drain
+        if (0x2000_0000..0x2008_0000).contains(&r_addr) {
+            self.emu.bus.memory.sram_write32(r_addr - 0x2000_0000, w);
+        }
+
+        out
     }
 
     /// Check whether a firmware menu overlay (Disks, Programs, Carts, Files, Info) is active.
@@ -313,15 +417,168 @@ impl CoCoZeroSoC {
         };
         self.inject_hid_keycode(keycode);
     }
+
+    /// Extract diagnostic telemetry across CPU cores, audio ring, and storage subsystems.
+    pub fn telemetry(&self) -> SocTelemetry {
+        let (sd_read, sd_written, sd_flushes) = self.sd_card.lock().unwrap().stats();
+        let w_addr = self.symbols.audio_w_addr;
+        let w = if (0x2000_0000..0x2008_2000).contains(&w_addr) {
+            self.emu.bus.memory.sram_read32(w_addr - 0x2000_0000)
+        } else {
+            0
+        };
+        let ring_watermark = w.wrapping_sub(self.host_audio_r);
+
+        SocTelemetry {
+            frame: self.frame_counter,
+            total_cycles: self.total_cycles,
+            cores: CoreTelemetry {
+                core0_pc: self.emu.core(0).regs.pc(),
+                core1_pc: self.emu.core(1).regs.pc(),
+                core0_wfe: self.emu.core(0).is_wfe_waiting(),
+                core1_wfe: self.emu.core(1).is_wfe_waiting(),
+                core0_cycles: self.emu.core(0).cycles(),
+                core1_cycles: self.emu.core(1).cycles(),
+            },
+            audio: AudioTelemetry {
+                total_samples_produced: w,
+                total_samples_drained: self.audio_samples_drained,
+                lapped_samples: self.audio_lapped_samples,
+                ring_watermark,
+            },
+            storage: StorageTelemetry {
+                sectors_read: sd_read,
+                sectors_written: sd_written,
+                flushes_performed: sd_flushes,
+            },
+        }
+    }
+
+    /// Extract the active 320×240 framebuffer and save it to a standard 24-bit BMP image.
+    pub fn dump_framebuffer_bmp(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let mut fb = [0u16; FB_PIXELS];
+        self.extract_frame(&mut fb);
+        save_bmp(path, &fb, FB_WIDTH, FB_HEIGHT)
+    }
+}
+
+/// Instantaneous and cumulative audio subsystem telemetry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioTelemetry {
+    pub total_samples_produced: u32,
+    pub total_samples_drained: u64,
+    pub lapped_samples: u64,
+    pub ring_watermark: u32,
+}
+
+/// MicroSD SPI storage telemetry metrics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StorageTelemetry {
+    pub sectors_read: u64,
+    pub sectors_written: u64,
+    pub flushes_performed: u64,
+}
+
+/// Multi-core processor state and cycle telemetry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoreTelemetry {
+    pub core0_pc: u32,
+    pub core1_pc: u32,
+    pub core0_wfe: bool,
+    pub core1_wfe: bool,
+    pub core0_cycles: u64,
+    pub core1_cycles: u64,
+}
+
+/// Consolidated system-on-chip telemetry snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SocTelemetry {
+    pub frame: u64,
+    pub total_cycles: u64,
+    pub cores: CoreTelemetry,
+    pub audio: AudioTelemetry,
+    pub storage: StorageTelemetry,
+}
+
+impl fmt::Display for SocTelemetry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[telemetry] frame={:>6} cycles={:>10} | C0: PC=0x{:08X} wfe={:<5} | C1: PC=0x{:08X} wfe={:<5} | Aud: drained={:<8} prod={:<8} lapped={:<4} wmark={:<4} | SD: r={:<6} w={:<6} flush={:<4}",
+            self.frame,
+            self.total_cycles,
+            self.cores.core0_pc,
+            self.cores.core0_wfe,
+            self.cores.core1_pc,
+            self.cores.core1_wfe,
+            self.audio.total_samples_drained,
+            self.audio.total_samples_produced,
+            self.audio.lapped_samples,
+            self.audio.ring_watermark,
+            self.storage.sectors_read,
+            self.storage.sectors_written,
+            self.storage.flushes_performed,
+        )
+    }
+}
+
+/// Save a 16-bit RGB565 framebuffer to a standard 24-bit uncompressed BMP file.
+pub fn save_bmp(path: impl AsRef<Path>, fb: &[u16], width: usize, height: usize) -> std::io::Result<()> {
+    if fb.len() < width * height {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Framebuffer buffer too small: expected {}, got {}", width * height, fb.len()),
+        ));
+    }
+    let row_padding = (4 - (width * 3) % 4) % 4;
+    let image_size = (width * 3 + row_padding) * height;
+    let file_size = 54 + image_size;
+
+    let mut bmp = Vec::with_capacity(file_size);
+
+    // BMP Header (14 bytes)
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+    bmp.extend_from_slice(&54u32.to_le_bytes()); // Pixel data offset
+
+    // DIB Header (BITMAPINFOHEADER, 40 bytes)
+    bmp.extend_from_slice(&40u32.to_le_bytes()); // Header size
+    bmp.extend_from_slice(&(width as i32).to_le_bytes());
+    bmp.extend_from_slice(&(height as i32).to_le_bytes()); // Positive height = bottom-up
+    bmp.extend_from_slice(&1u16.to_le_bytes()); // Color planes
+    bmp.extend_from_slice(&24u16.to_le_bytes()); // Bits per pixel (24-bit RGB)
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // Compression (BI_RGB, uncompressed)
+    bmp.extend_from_slice(&(image_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&2835u32.to_le_bytes()); // Horizontal resolution (72 DPI)
+    bmp.extend_from_slice(&2835u32.to_le_bytes()); // Vertical resolution (72 DPI)
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // Colors in palette
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // Important colors
+
+    // Pixel data (bottom-up: row height-1 down to row 0)
+    for y in (0..height).rev() {
+        for x in 0..width {
+            let pixel565 = fb[y * width + x];
+            let r = (((pixel565 >> 11) & 0x1F) as u32 * 255 / 31) as u8;
+            let g = (((pixel565 >> 5) & 0x3F) as u32 * 255 / 63) as u8;
+            let b = ((pixel565 & 0x1F) as u32 * 255 / 31) as u8;
+            bmp.push(b); // Blue
+            bmp.push(g); // Green
+            bmp.push(r); // Red
+        }
+        bmp.resize(bmp.len() + row_padding, 0);
+    }
+
+    std::fs::write(path, bmp)
 }
 
 /// Physical SRAM address of menu active flag (1 = active, 0 = inactive).
-pub const MENU_ACTIVE_ADDR: u32 = 0x2000_c8d0;
+pub const MENU_ACTIVE_ADDR: u32 = 0x2000_c8e8;
 /// Physical SRAM address of active menu mode (0 = Disks, 1 = Programs, 2 = Carts, 3 = Files, 4 = Info).
-pub const MENU_MODE_ADDR: u32 = 0x2000_c8d4;
+pub const MENU_MODE_ADDR: u32 = 0x2000_c8ec;
 /// Physical SRAM address of TinyUSB HID keyboard report buffer.
 pub const HID_REPORT_ADDR: u32 = 0x2001_c18c;
 /// Entry point of TinyUSB host HID report callback in firmware flash.
-pub const HID_CB_ADDR: u32 = 0x1001_f460;
+pub const HID_CB_ADDR: u32 = 0x1001_f3a4;
 /// Scratch trampoline location in upper SRAM.
 pub const TRAMP_ADDR: u32 = 0x2007_ffe0;

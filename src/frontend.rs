@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 
 use sdl2::audio::{AudioQueue, AudioSpecDesired};
+use sdl2::controller::{Button, GameController};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::PixelFormatEnum;
@@ -17,6 +18,9 @@ pub const FRAME_WIDTH: usize = 320;
 pub const FRAME_HEIGHT: usize = 240;
 pub const DISPLAY_WIDTH: u32 = 640;
 pub const DISPLAY_HEIGHT: u32 = 480;
+/// Maximum bytes allowed in the SDL2 audio queue (~100 ms of 48 kHz 16-bit stereo PCM)
+/// to prevent latency runaway under turbo speed.
+pub const AUDIO_QUEUE_MAX_BYTES: u32 = 48_000 * 2 * 2 / 10; // 19,200 bytes
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKeyEvent {
@@ -31,15 +35,25 @@ pub struct Frontend {
     texture: Texture<'static>,
     audio_queue: Option<AudioQueue<i16>>,
     event_pump: EventPump,
+    pub _controllers: Vec<GameController>,
     pub serial_input_queue: Vec<u8>,
     pub typed_chars: VecDeque<char>,
     pub key_events: Vec<InputKeyEvent>,
     pub hid_key_queue: VecDeque<u8>,
     pub key_matrix: [u8; 8], // 8x8 CoCo keyboard matrix
+    pub audio_queue_max_bytes: u32,
 }
 
 impl Frontend {
     pub fn new(headless: bool) -> Result<Self, String> {
+        if headless {
+            // Safety: In headless mode (such as unit tests and background CI runs), set SDL
+            // dummy drivers prior to SDL subsystem initialization.
+            unsafe {
+                std::env::set_var("SDL_VIDEODRIVER", "dummy");
+                std::env::set_var("SDL_AUDIODRIVER", "dummy");
+            }
+        }
         sdl2::hint::set("SDL_MAC_BACKGROUND_APP", "0");
         let sdl = sdl2::init().map_err(|e| e.to_string())?;
         let video_subsystem = sdl.video().map_err(|e| e.to_string())?;
@@ -75,7 +89,6 @@ impl Frontend {
 
         let static_texture: Texture<'static> = unsafe { std::mem::transmute(texture) };
 
-
         // Initialize Audio Subsystem
         let audio_queue = if let Ok(audio_subsystem) = sdl.audio() {
             let desired_spec = AudioSpecDesired {
@@ -97,6 +110,21 @@ impl Frontend {
             None
         };
 
+        // Initialize GameController Subsystem
+        let mut controllers = Vec::new();
+        if let Ok(gc_subsystem) = sdl.game_controller()
+            && let Ok(num) = gc_subsystem.num_joysticks()
+        {
+            for i in 0..num {
+                if gc_subsystem.is_game_controller(i)
+                    && let Ok(controller) = gc_subsystem.open(i)
+                {
+                    eprintln!("[Gamepad] Discovered controller: {}", controller.name());
+                    controllers.push(controller);
+                }
+            }
+        }
+
         let event_pump = sdl.event_pump().map_err(|e| e.to_string())?;
 
         Ok(Self {
@@ -106,12 +134,21 @@ impl Frontend {
             texture: static_texture,
             audio_queue,
             event_pump,
+            _controllers: controllers,
             serial_input_queue: Vec::new(),
             typed_chars: VecDeque::new(),
             key_events: Vec::new(),
             hid_key_queue: VecDeque::new(),
             key_matrix: [0xFF; 8],
+            audio_queue_max_bytes: AUDIO_QUEUE_MAX_BYTES,
         })
+    }
+
+    /// Configure maximum audio queue buffer limit in milliseconds (default: 100 ms).
+    pub fn set_audio_buffer_ms(&mut self, ms: u32) {
+        // 48 kHz * 2 channels (stereo) * 2 bytes/sample (16-bit) = 192 bytes/ms
+        let bytes_per_ms = 48 * 2 * 2;
+        self.audio_queue_max_bytes = ms.max(10) * bytes_per_ms;
     }
 
     /// Render a 320×240 RGB565 framebuffer from RP2350 SRAM.
@@ -143,8 +180,8 @@ impl Frontend {
     /// Push audio PCM samples (16-bit signed stereo, 48 kHz).
     pub fn push_audio(&mut self, samples: &[i16]) {
         if let Some(queue) = &mut self.audio_queue {
-            // Keep queue bounded to avoid huge latency
-            if queue.size() < 48_000 * 2 * 2 {
+            // Keep queue bounded to avoid latency runaway
+            if queue.size() < self.audio_queue_max_bytes {
                 let _ = queue.queue_audio(samples);
             }
         }
@@ -204,6 +241,23 @@ impl Frontend {
                         self.handle_key_up(key);
                     }
                 }
+                Event::ControllerDeviceAdded { which, .. } => {
+                    if let Ok(gc_subsystem) = self._sdl.game_controller()
+                        && let Ok(controller) = gc_subsystem.open(which)
+                    {
+                        eprintln!("[Gamepad] Connected: {}", controller.name());
+                        self._controllers.push(controller);
+                    }
+                }
+                Event::ControllerDeviceRemoved { which, .. } => {
+                    self._controllers.retain(|c| c.instance_id() != which);
+                }
+                Event::ControllerButtonDown { button, .. } => {
+                    self.handle_controller_button_down(button, is_menu_active);
+                }
+                Event::ControllerButtonUp { button, .. } => {
+                    self.handle_controller_button_up(button, is_menu_active);
+                }
                 Event::MouseButtonDown { .. } => {
                     self.canvas.window_mut().raise();
                 }
@@ -213,7 +267,7 @@ impl Frontend {
         true
     }
 
-    fn handle_key_down(
+    pub fn handle_key_down(
         &mut self,
         key: Keycode,
         shift: bool,
@@ -252,8 +306,13 @@ impl Frontend {
             self.hid_key_queue.push_back(0x41); // HID F8
             return;
         }
+        if key == Keycode::PrintScreen {
+            eprintln!("[Action] PrintScreen -> Screenshot");
+            self.hid_key_queue.push_back(0x46); // HID PrintScreen
+            return;
+        }
 
-        // 2. When menu overlay is active, route navigation keys directly to menu
+        // 2. When menu overlay is active, route navigation and dialog keys directly to menu
         if is_menu_active {
             match key {
                 Keycode::Up => {
@@ -289,8 +348,28 @@ impl Frontend {
                     self.hid_key_queue.push_back(0x29); // HID KEY_ESCAPE
                 }
                 Keycode::Tab => {
-                    eprintln!("[Menu Nav] Tab");
+                    eprintln!("[Menu Nav] Tab (Edit .TXT)");
                     self.hid_key_queue.push_back(0x2B); // HID KEY_TAB
+                }
+                Keycode::Backspace | Keycode::Delete => {
+                    eprintln!("[Menu Nav] Backspace");
+                    self.hid_key_queue.push_back(0x2A); // HID KEY_BACKSPACE
+                }
+                Keycode::Space => {
+                    eprintln!("[Menu Nav] Space");
+                    self.hid_key_queue.push_back(0x2C); // HID KEY_SPACE
+                }
+                Keycode::W => {
+                    eprintln!("[Menu Action] Toggle Drive Write Lock (W)");
+                    self.hid_key_queue.push_back(0x1A); // HID KEY_W
+                }
+                Keycode::N => {
+                    eprintln!("[Menu Action] Format New Disk (N)");
+                    self.hid_key_queue.push_back(0x11); // HID KEY_N
+                }
+                Keycode::R => {
+                    eprintln!("[Menu Action] Rename Disk Image (R)");
+                    self.hid_key_queue.push_back(0x15); // HID KEY_R
                 }
                 Keycode::Num0 | Keycode::Kp0 => {
                     eprintln!("[Menu Nav] Drive 0");
@@ -308,7 +387,24 @@ impl Frontend {
                     eprintln!("[Menu Nav] Drive 3");
                     self.hid_key_queue.push_back(0x20); // HID '3'
                 }
-                _ => {}
+                k => {
+                    if let Some(ch) = keycode_to_char(k, false) {
+                        match ch {
+                            'a'..='z' => {
+                                let letter = ch as u8 - b'a';
+                                self.hid_key_queue.push_back(0x04 + letter);
+                            }
+                            '1'..='9' => {
+                                let digit = ch as u8 - b'1';
+                                self.hid_key_queue.push_back(0x1E + digit);
+                            }
+                            '0' => {
+                                self.hid_key_queue.push_back(0x27);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             return;
         }
@@ -334,6 +430,11 @@ impl Frontend {
             Keycode::Home => {
                 eprintln!("[Input] KeyDown: Clear");
                 self.typed_chars.push_back('\x0C');
+            }
+            Keycode::Space => {
+                eprintln!("[Input] KeyDown: Space");
+                self.typed_chars.push_back(' ');
+                self.key_events.push(InputKeyEvent::Down(key));
             }
             Keycode::Up => {
                 eprintln!("[Input] KeyDown: Up");
@@ -370,12 +471,92 @@ impl Frontend {
         }
     }
 
-    fn handle_key_up(&mut self, key: Keycode) {
+    pub fn handle_key_up(&mut self, key: Keycode) {
         match key {
-            Keycode::Up | Keycode::Down | Keycode::Left | Keycode::Right | Keycode::LShift | Keycode::RShift => {
+            Keycode::Up
+            | Keycode::Down
+            | Keycode::Left
+            | Keycode::Right
+            | Keycode::Space
+            | Keycode::LShift
+            | Keycode::RShift => {
                 self.key_events.push(InputKeyEvent::Up(key));
             }
             _ => {}
+        }
+    }
+
+    pub fn handle_controller_button_down(&mut self, button: Button, is_menu_active: bool) {
+        if is_menu_active {
+            match button {
+                Button::DPadUp => self.hid_key_queue.push_back(0x52), // HID KEY_UP
+                Button::DPadDown => self.hid_key_queue.push_back(0x51), // HID KEY_DOWN
+                Button::DPadLeft => self.hid_key_queue.push_back(0x50), // HID KEY_LEFT
+                Button::DPadRight => self.hid_key_queue.push_back(0x4F), // HID KEY_RIGHT
+                Button::A => self.hid_key_queue.push_back(0x28), // HID KEY_ENTER (Select/Start)
+                Button::B | Button::Back => self.hid_key_queue.push_back(0x29), // HID KEY_ESCAPE (Close menu)
+                Button::LeftShoulder => self.hid_key_queue.push_back(0x4B), // HID KEY_PAGE_UP
+                Button::RightShoulder => self.hid_key_queue.push_back(0x4E), // HID KEY_PAGE_DOWN
+                Button::X => self.hid_key_queue.push_back(0x2B), // HID KEY_TAB (Open editor on .TXT)
+                Button::Guide => self.hid_key_queue.push_back(0x29), // HID KEY_ESCAPE (Toggle menu closed)
+                _ => {}
+            }
+        } else {
+            match button {
+                Button::Guide => {
+                    // Home/Guide opens Disks menu
+                    self.hid_key_queue.push_back(0x45); // HID F12
+                }
+                Button::Start => {
+                    self.typed_chars.push_back('\r');
+                }
+                Button::Y => {
+                    self.typed_chars.push_back(' ');
+                }
+                Button::A | Button::RightShoulder => {
+                    self.key_events.push(InputKeyEvent::Down(Keycode::Space));
+                }
+                Button::DPadUp => {
+                    self.typed_chars.push_back('^');
+                    self.key_events.push(InputKeyEvent::Down(Keycode::Up));
+                }
+                Button::DPadDown => {
+                    self.typed_chars.push_back('[');
+                    self.key_events.push(InputKeyEvent::Down(Keycode::Down));
+                }
+                Button::DPadLeft => {
+                    self.typed_chars.push_back('\x08');
+                    self.key_events.push(InputKeyEvent::Down(Keycode::Left));
+                }
+                Button::DPadRight => {
+                    self.typed_chars.push_back(']');
+                    self.key_events.push(InputKeyEvent::Down(Keycode::Right));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn handle_controller_button_up(&mut self, button: Button, is_menu_active: bool) {
+        if !is_menu_active {
+            match button {
+                Button::A | Button::RightShoulder => {
+                    self.key_events.push(InputKeyEvent::Up(Keycode::Space));
+                }
+                Button::DPadUp => {
+                    self.key_events.push(InputKeyEvent::Up(Keycode::Up));
+                }
+                Button::DPadDown => {
+                    self.key_events.push(InputKeyEvent::Up(Keycode::Down));
+                }
+                Button::DPadLeft => {
+                    self.key_events.push(InputKeyEvent::Up(Keycode::Left));
+                }
+                Button::DPadRight => {
+                    self.key_events.push(InputKeyEvent::Up(Keycode::Right));
+                }
+                _ => {}
+            }
         }
     }
 }

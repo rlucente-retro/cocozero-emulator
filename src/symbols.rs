@@ -17,17 +17,23 @@ pub struct FirmwareSymbols {
     pub menu_mode_addr: u32,
     pub menu_count_addr: u32,
     pub hid_cb_addr: u32,
+    pub audio_ring_addr: u32,
+    pub audio_w_addr: u32,
+    pub audio_r_addr: u32,
 }
 
 impl Default for FirmwareSymbols {
     fn default() -> Self {
         Self {
-            fb_addr: 0x2002_2900,
+            fb_addr: 0x2002_2780,
             kb_matrix_addr: 0x2000_b304,
-            menu_active_addr: 0x2000_c8d0,
-            menu_mode_addr: 0x2000_c8d4,
-            menu_count_addr: 0x2000_c8e4,
-            hid_cb_addr: 0x1001_f460,
+            menu_active_addr: 0x2000_c8e8,
+            menu_mode_addr: 0x2000_c8ec,
+            menu_count_addr: 0x2000_c8fc,
+            hid_cb_addr: 0x1001_f3a4,
+            audio_ring_addr: 0x2001_80c4,
+            audio_w_addr: 0x2004_b8a0,
+            audio_r_addr: 0x2004_b89c,
         }
     }
 }
@@ -125,6 +131,15 @@ impl FirmwareSymbols {
         if let Some(&addr) = syms.get("tuh_hid_report_received_cb") {
             res.hid_cb_addr = addr & !1; // clear thumb bit
         }
+        if let Some(&addr) = syms.get("_ZL12g_audio_ring").or_else(|| syms.get("g_audio_ring")) {
+            res.audio_ring_addr = addr;
+        }
+        if let Some(&addr) = syms.get("_ZL9g_audio_w").or_else(|| syms.get("g_audio_w")) {
+            res.audio_w_addr = addr;
+        }
+        if let Some(&addr) = syms.get("_ZL9g_audio_r").or_else(|| syms.get("g_audio_r")) {
+            res.audio_r_addr = addr;
+        }
 
         Ok(res)
     }
@@ -183,40 +198,60 @@ impl FirmwareSymbols {
             }
         }
 
+        // 5. Scan for audio ring buffer literal pool:
+        //    Function epilogue of coco_machine_audio_read:
+        //    mov r6, r2; b ...; nop
+        //    Bytes: [0x16, 0x46, 0xF0, 0xE7, 0x00, 0xBF]
+        let pat_audio = [0x16, 0x46, 0xF0, 0xE7, 0x00, 0xBF];
+        if let Some(pos) = flash_bytes.windows(pat_audio.len()).position(|w| w == pat_audio) {
+            let lit = pos + pat_audio.len();
+            if lit + 16 <= flash_bytes.len() {
+                let w0 = u32::from_le_bytes(flash_bytes[lit..lit + 4].try_into().unwrap());
+                let w1 = u32::from_le_bytes(flash_bytes[lit + 4..lit + 8].try_into().unwrap());
+                let w3 = u32::from_le_bytes(flash_bytes[lit + 12..lit + 16].try_into().unwrap());
+                if (0x2000_0000..=0x2008_0000).contains(&w0)
+                    && (0x2000_0000..=0x2008_0000).contains(&w1)
+                    && (0x2000_0000..=0x2008_0000).contains(&w3)
+                {
+                    res.audio_w_addr = w0;
+                    res.audio_r_addr = w1;
+                    res.audio_ring_addr = w3;
+                }
+            }
+        }
+
         res
+    }
+
+    /// Helper to attempt reading and parsing symbols from an ELF file.
+    fn try_load_elf(path: &Path) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        Self::from_elf(&bytes).ok()
     }
 
     /// Auto-detect symbols from an optional ELF file or by signature scanning flash bytes.
     pub fn auto_detect(elf_path: Option<&Path>, flash_bytes: &[u8], base_addr: u32) -> Self {
         // 1. Try specified ELF path
-        if let Some(path) = elf_path {
-            if path.exists() {
-                if let Ok(bytes) = std::fs::read(path) {
-                    if let Ok(syms) = Self::from_elf(&bytes) {
-                        eprintln!("[Symbols] Auto-detected from {}: fb=0x{:08X}, kb=0x{:08X}, menu=0x{:08X}, hid_cb=0x{:08X}",
-                            path.display(), syms.fb_addr, syms.kb_matrix_addr, syms.menu_active_addr, syms.hid_cb_addr);
-                        return syms;
-                    }
-                }
-            }
+        if let Some(path) = elf_path
+            && let Some(syms) = Self::try_load_elf(path)
+        {
+            eprintln!("[Symbols] Auto-detected from {}: fb=0x{:08X}, kb=0x{:08X}, menu=0x{:08X}, hid_cb=0x{:08X}, audio_ring=0x{:08X}",
+                path.display(), syms.fb_addr, syms.kb_matrix_addr, syms.menu_active_addr, syms.hid_cb_addr, syms.audio_ring_addr);
+            return syms;
         }
 
         // 2. Try conventional roms/cocozero.elf
         let default_elf = Path::new("roms/cocozero.elf");
-        if default_elf.exists() {
-            if let Ok(bytes) = std::fs::read(default_elf) {
-                if let Ok(syms) = Self::from_elf(&bytes) {
-                    eprintln!("[Symbols] Auto-detected from roms/cocozero.elf: fb=0x{:08X}, kb=0x{:08X}, menu=0x{:08X}, hid_cb=0x{:08X}",
-                        syms.fb_addr, syms.kb_matrix_addr, syms.menu_active_addr, syms.hid_cb_addr);
-                    return syms;
-                }
-            }
+        if let Some(syms) = Self::try_load_elf(default_elf) {
+            eprintln!("[Symbols] Auto-detected from {}: fb=0x{:08X}, kb=0x{:08X}, menu=0x{:08X}, hid_cb=0x{:08X}, audio_ring=0x{:08X}",
+                default_elf.display(), syms.fb_addr, syms.kb_matrix_addr, syms.menu_active_addr, syms.hid_cb_addr, syms.audio_ring_addr);
+            return syms;
         }
 
         // 3. Fall back to flash signature scanning
         let syms = Self::from_flash_signatures(flash_bytes, base_addr);
-        eprintln!("[Symbols] Auto-detected from Flash signature scan: fb=0x{:08X}, kb=0x{:08X}, menu=0x{:08X}, hid_cb=0x{:08X}",
-            syms.fb_addr, syms.kb_matrix_addr, syms.menu_active_addr, syms.hid_cb_addr);
+        eprintln!("[Symbols] Auto-detected from Flash signature scan: fb=0x{:08X}, kb=0x{:08X}, menu=0x{:08X}, hid_cb=0x{:08X}, audio_ring=0x{:08X}",
+            syms.fb_addr, syms.kb_matrix_addr, syms.menu_active_addr, syms.hid_cb_addr, syms.audio_ring_addr);
         syms
     }
 }
@@ -237,12 +272,15 @@ mod tests {
 
         let bytes = std::fs::read(elf_path).expect("Failed to read ELF");
         let syms = FirmwareSymbols::from_elf(&bytes).expect("Failed to parse ELF symbols");
-        assert_eq!(syms.fb_addr, 0x2002_2900);
+        assert_eq!(syms.fb_addr, 0x2002_2780);
         assert_eq!(syms.kb_matrix_addr, 0x2000_b304);
-        assert_eq!(syms.menu_active_addr, 0x2000_c8d0);
-        assert_eq!(syms.menu_mode_addr, 0x2000_c8d4);
-        assert_eq!(syms.menu_count_addr, 0x2000_c8e4);
-        assert_eq!(syms.hid_cb_addr, 0x1001_f460);
+        assert_eq!(syms.menu_active_addr, 0x2000_c8e8);
+        assert_eq!(syms.menu_mode_addr, 0x2000_c8ec);
+        assert_eq!(syms.menu_count_addr, 0x2000_c8fc);
+        assert_eq!(syms.hid_cb_addr, 0x1001_f3a4);
+        assert_eq!(syms.audio_ring_addr, 0x2001_80c4);
+        assert_eq!(syms.audio_w_addr, 0x2004_b8a0);
+        assert_eq!(syms.audio_r_addr, 0x2004_b89c);
     }
 
     #[test]
@@ -258,10 +296,13 @@ mod tests {
         let syms = FirmwareSymbols::from_flash_signatures(&flash.memory, crate::uf2::FLASH_BASE);
 
         assert_eq!(syms.kb_matrix_addr, 0x2000_b304);
-        assert_eq!(syms.menu_active_addr, 0x2000_c8d0);
-        assert_eq!(syms.menu_mode_addr, 0x2000_c8d4);
-        assert_eq!(syms.menu_count_addr, 0x2000_c8e4);
-        assert_eq!(syms.hid_cb_addr, 0x1001_f460);
-        assert_eq!(syms.fb_addr, 0x2002_2900);
+        assert_eq!(syms.menu_active_addr, 0x2000_c8e8);
+        assert_eq!(syms.menu_mode_addr, 0x2000_c8ec);
+        assert_eq!(syms.menu_count_addr, 0x2000_c8fc);
+        assert_eq!(syms.hid_cb_addr, 0x1001_f3a4);
+        assert_eq!(syms.fb_addr, 0x2002_2780);
+        assert_eq!(syms.audio_ring_addr, 0x2001_80c4);
+        assert_eq!(syms.audio_w_addr, 0x2004_b8a0);
+        assert_eq!(syms.audio_r_addr, 0x2004_b89c);
     }
 }

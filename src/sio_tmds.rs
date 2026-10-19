@@ -241,7 +241,7 @@ mod tests {
         // ( 3 << L1_ROT) | (5 << L1_NBITS) |
         // ( 8 << L2_ROT) | (4 << L2_NBITS) |
         // ( 5 << PIX_SHIFT) | PIX2_NOSHIFT
-        let rgb565_ctrl = (13 << 0)
+        let rgb565_ctrl = 13 // (13 << L0_ROT) with L0_ROT = 0
             | (4 << 12)
             | (3 << 4)
             | (5 << 15)

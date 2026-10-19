@@ -109,7 +109,7 @@ pub fn keycode_to_dscan(key: Keycode) -> Option<u8> {
         Keycode::Right => Some(K_RIGHT),
         Keycode::LShift | Keycode::RShift => Some(K_SHIFT),
         Keycode::Home => Some(K_CLEAR),
-        _ => None,
+        k => crate::frontend::keycode_to_char(k, false).and_then(|c| kt_chord(c).map(|(d, _)| d)),
     }
 }
 
@@ -124,9 +124,9 @@ pub struct KeyboardMatrix {
     /// Queue of ASCII characters to type sequentially.
     type_queue: VecDeque<char>,
     /// Frame countdown for holding currently typed character.
-    hold_countdown: u8,
+    hold_countdown: u32,
     /// Frame countdown for inter-character release gap.
-    gap_countdown: u8,
+    gap_countdown: u32,
 }
 
 impl Default for KeyboardMatrix {
@@ -155,9 +155,7 @@ impl KeyboardMatrix {
 
     /// Enqueue a string of characters to be typed sequentially.
     pub fn type_str(&mut self, s: &str) {
-        for c in s.chars() {
-            self.type_queue.push_back(c);
-        }
+        self.type_queue.extend(s.chars());
     }
 
     /// Press a physical key via its SDL Keycode.
@@ -195,7 +193,7 @@ impl KeyboardMatrix {
             self.hold_countdown -= 1;
             if self.hold_countdown == 0 {
                 self.typed_matrix = [0xFF; 8];
-                self.gap_countdown = (2 * t).min(255) as u8; // 2 virtual 60 Hz frames release gap
+                self.gap_countdown = 2 * t; // 2 virtual 60 Hz frames release gap
             }
         } else if self.gap_countdown > 0 {
             self.gap_countdown -= 1;
@@ -208,8 +206,10 @@ impl KeyboardMatrix {
                     let (s_row, s_col) = dscan_to_row_col(K_SHIFT);
                     self.typed_matrix[s_col as usize] &= !(1 << s_row);
                 }
-                self.hold_countdown = (4 * t).min(255) as u8; // 4 virtual 60 Hz frames hold duration (~66.7 ms)
+                self.hold_countdown = 4 * t; // 4 virtual 60 Hz frames hold duration (~66.7 ms)
                 eprintln!("[CoCo Keyboard] Injected key {:?} into matrix (held for {} virtual frames)", c, self.hold_countdown);
+            } else {
+                eprintln!("[CoCo Keyboard] Warning: Unmapped character {:?}", c);
             }
         }
 

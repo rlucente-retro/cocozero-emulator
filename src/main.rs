@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use clap::Parser;
 
-use cocozero_rp2350::fat32::build_virtual_fat32;
+use cocozero_rp2350::fat32::VirtualFat32Storage;
 use cocozero_rp2350::frontend::Frontend;
 
 use cocozero_rp2350::soc::{CoCoZeroSoC, FB_PIXELS};
@@ -42,8 +42,8 @@ struct Args {
     headless: bool,
 
     /// Maximum frames to run before exiting (0 = run indefinitely)
-    #[arg(long, default_value_t = 0)]
-    max_frames: u64,
+    #[arg(short = 'f', long = "frames", alias = "max-frames", default_value_t = 0)]
+    frames: u64,
 
     /// Simulation turbo factor (1 = 252 MHz, 2 = 2x speedup / 126 MHz virtual frame quantum, 4 = 4x speedup, etc.)
     #[arg(long, default_value_t = 2)]
@@ -52,6 +52,38 @@ struct Args {
     /// Override framebuffer SRAM address (e.g. 0x20010000)
     #[arg(long)]
     fb_addr: Option<String>,
+
+    /// Enqueue ASCII text to be typed into Color BASIC once initialization is complete
+    #[arg(long = "type")]
+    type_str: Option<String>,
+
+    /// Path to a text script file to be typed into Color BASIC once initialization is complete
+    #[arg(long = "script")]
+    script: Option<PathBuf>,
+
+    /// Dump framebuffer to a 24-bit BMP file at the specified frame number
+    #[arg(long)]
+    dump_frame: Option<u64>,
+
+    /// Destination file path for dumped framebuffer BMP (default: frame_<N>.bmp)
+    #[arg(long)]
+    dump_path: Option<PathBuf>,
+
+    /// Enable periodic diagnostic telemetry reports
+    #[arg(long)]
+    telemetry: bool,
+
+    /// Interval in frames between periodic telemetry reports (default: 60)
+    #[arg(long, default_value_t = 60)]
+    telemetry_interval: u64,
+
+    /// Periodic SD card storage flush interval in frames (default: 300)
+    #[arg(long, default_value_t = 300)]
+    sync_interval: u64,
+
+    /// Audio buffer latency budget in milliseconds (default: 100)
+    #[arg(long, default_value_t = 100)]
+    audio_buffer_ms: u32,
 }
 
 fn main() {
@@ -69,16 +101,14 @@ fn main() {
             Box::new(FileStorage::open(path).expect("Failed to open SD image file"))
         }
         Some(path) if path.is_dir() => {
-            println!("Building virtual FAT32 filesystem from: {}", path.display());
-            let img = build_virtual_fat32(path).expect("Failed to build virtual FAT32");
-            Box::new(MemoryStorage::from_bytes(img))
+            println!("Mounting directory as virtual FAT32 SD card: {}", path.display());
+            Box::new(VirtualFat32Storage::from_directory(path).expect("Failed to build virtual FAT32"))
         }
         _ => {
             let default_dir = Path::new("coco");
             if default_dir.is_dir() {
-                println!("Auto-mounting local ./coco directory as SD card...");
-                let img = build_virtual_fat32(default_dir).expect("Failed to build virtual FAT32");
-                Box::new(MemoryStorage::from_bytes(img))
+                println!("Auto-mounting local ./coco directory as virtual FAT32 SD card...");
+                Box::new(VirtualFat32Storage::from_directory(default_dir).expect("Failed to build virtual FAT32"))
             } else {
                 println!("No SD card specified; initializing empty 64 MB virtual card");
                 Box::new(MemoryStorage::new(64 * 1024 * 1024))
@@ -142,6 +172,7 @@ fn main() {
 
     // 5. Initialize Frontend
     let mut frontend = Frontend::new(args.headless).expect("Failed to initialize SDL2 frontend");
+    frontend.set_audio_buffer_ms(args.audio_buffer_ms);
     println!("SDL2 frontend initialized successfully.");
     if !args.headless {
         println!("Display window opened: {}x{} @ 60 Hz", 640, 480);
@@ -154,6 +185,7 @@ fn main() {
     let start_time = Instant::now();
     let mut last_fps_time = Instant::now();
     let mut fps_counter = 0;
+    let mut had_error = false;
 
     // Spawn background non-blocking stdin reader for terminal typing
     let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<char>();
@@ -173,9 +205,12 @@ fn main() {
         }
     });
 
+    let target_frame_duration = std::time::Duration::from_nanos(1_000_000_000 / 60);
     let mut basic_ready_announced = false;
 
     loop {
+        let frame_start = Instant::now();
+
         // Poll frontend input events (pass current menu active state)
         let is_menu_active = soc.is_menu_active();
         if !frontend.poll_events(is_menu_active) {
@@ -216,20 +251,83 @@ fn main() {
         // Advance simulation by 1 frame (divided by turbo factor)
         if let Err(e) = soc.step_frame_turbo(args.turbo) {
             eprintln!("\nSimulation error at frame {}: {}", frame_count, e);
+            had_error = true;
             break;
         }
 
         if !basic_ready_announced && soc.is_keyboard_ready() {
             basic_ready_announced = true;
             println!("\n[System Ready] Color BASIC initialization complete! Ready for keyboard input.");
+
+            // Inject scripted commands from file if specified
+            if let Some(script_path) = &args.script {
+                match std::fs::read_to_string(script_path) {
+                    Ok(content) => {
+                        println!("[Script] Injecting commands from {}:", script_path.display());
+                        for line in content.lines() {
+                            let trimmed = line.trim_end();
+                            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                                println!("  > {}", trimmed);
+                                soc.type_str(trimmed);
+                                soc.type_char('\r');
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Script] Failed to read script file {}: {}", script_path.display(), e);
+                    }
+                }
+            }
+
+            // Inject directly specified --type text if provided
+            if let Some(text) = &args.type_str {
+                println!("[Script] Injecting command text: {:?}", text);
+                let unescaped = text.replace("\\n", "\n").replace("\\r", "\r");
+                for ch in unescaped.chars() {
+                    let mapped = match ch {
+                        '\n' => '\r',
+                        c => c,
+                    };
+                    soc.type_char(mapped);
+                }
+            }
         }
 
         // Extract and render framebuffer
         soc.extract_frame(&mut fb_buffer);
         let _ = frontend.render_frame(&fb_buffer);
 
+        // Screen dump capture if requested at current frame
+        if let Some(target) = args.dump_frame
+            && frame_count == target
+        {
+            let out_path = args.dump_path.clone().unwrap_or_else(|| {
+                PathBuf::from(format!("frame_{}.bmp", target))
+            });
+            match soc.dump_framebuffer_bmp(&out_path) {
+                Ok(()) => println!("\n[Screen Dump] Captured frame {} to {}", target, out_path.display()),
+                Err(e) => eprintln!("\n[Screen Dump] Failed to dump frame {}: {}", target, e),
+            }
+        }
+
+        // Extract and push audio samples to frontend
+        let audio_samples = soc.extract_audio();
+        if !audio_samples.is_empty() {
+            frontend.push_audio(&audio_samples);
+        }
+
         frame_count += 1;
         fps_counter += 1;
+
+        // Periodic sync to host every sync_interval frames if dirty
+        if args.sync_interval > 0 && frame_count.is_multiple_of(args.sync_interval) {
+            soc.flush_storage();
+        }
+
+        // Periodic diagnostic telemetry logging if enabled
+        if args.telemetry && frame_count.is_multiple_of(args.telemetry_interval) {
+            println!("{}", soc.telemetry());
+        }
 
         if last_fps_time.elapsed().as_secs() >= 1 {
             let elapsed = last_fps_time.elapsed().as_secs_f64();
@@ -245,9 +343,16 @@ fn main() {
             last_fps_time = Instant::now();
         }
 
-        if args.max_frames > 0 && frame_count >= args.max_frames {
-            println!("\nReached maximum frames ({}); exiting.", args.max_frames);
+        if args.frames > 0 && frame_count >= args.frames {
+            println!("\nReached maximum frames ({}); exiting cleanly.", args.frames);
             break;
+        }
+
+        if !args.headless {
+            let elapsed = frame_start.elapsed();
+            if elapsed < target_frame_duration {
+                std::thread::sleep(target_frame_duration - elapsed);
+            }
         }
     }
 
@@ -258,4 +363,16 @@ fn main() {
         total_elapsed,
         frame_count as f64 / total_elapsed.max(0.001)
     );
+
+    if args.telemetry {
+        println!("\n--- Final Diagnostic Telemetry ---");
+        println!("{}", soc.telemetry());
+    }
+
+    // Flush any pending SD card sector writes to host storage on exit
+    soc.flush_storage();
+
+    if had_error {
+        std::process::exit(1);
+    }
 }

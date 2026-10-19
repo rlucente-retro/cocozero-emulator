@@ -86,7 +86,7 @@ impl FlashImage {
 
 /// Parse a UF2 file and populate a FlashImage.
 pub fn parse_uf2(data: &[u8]) -> Result<FlashImage, String> {
-    if data.len() % 512 != 0 {
+    if !data.len().is_multiple_of(512) {
         return Err(format!("UF2 file size ({}) must be a multiple of 512 bytes", data.len()));
     }
 

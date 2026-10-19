@@ -53,17 +53,24 @@ pub struct SpiSdCard {
     app_cmd_next: bool,
     cmd_buf: Vec<u8>,
     rx_queue: VecDeque<u8>,
-    backing: Box<dyn SectorStorage + Send>,
+    pub backing: Box<dyn SectorStorage + Send>,
     cs_asserted: bool,
     pub cmd_history: Vec<(u8, u32)>,
     curr_sector_buf: [u8; SD_SECTOR_SIZE],
     curr_sector_crc: u16,
+    pub sectors_read: u64,
+    pub sectors_written: u64,
+    pub flushes_performed: u64,
 }
 
 pub trait SectorStorage: Send {
     fn num_sectors(&self) -> u64;
     fn read_sector(&mut self, sector: u64, out: &mut [u8; SD_SECTOR_SIZE]) -> bool;
     fn write_sector(&mut self, sector: u64, data: &[u8; SD_SECTOR_SIZE]) -> bool;
+    /// Flush any pending writes to host storage.
+    fn flush(&mut self) -> bool {
+        true
+    }
 }
 
 pub struct MemoryStorage {
@@ -150,6 +157,10 @@ impl SectorStorage for FileStorage {
         }
         self.file.write_all(data).is_ok()
     }
+
+    fn flush(&mut self) -> bool {
+        self.file.flush().is_ok()
+    }
 }
 
 impl SpiSdCard {
@@ -164,7 +175,21 @@ impl SpiSdCard {
             cmd_history: Vec::new(),
             curr_sector_buf: [0u8; SD_SECTOR_SIZE],
             curr_sector_crc: 0,
+            sectors_read: 0,
+            sectors_written: 0,
+            flushes_performed: 0,
         }
+    }
+
+    /// Flush any pending writes through to the backing storage.
+    pub fn flush(&mut self) -> bool {
+        self.flushes_performed += 1;
+        self.backing.flush()
+    }
+
+    /// Return cumulative storage telemetry statistics (sectors read, sectors written, flushes performed).
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (self.sectors_read, self.sectors_written, self.flushes_performed)
     }
 
     pub fn set_cs(&mut self, asserted: bool) {
@@ -178,6 +203,7 @@ impl SpiSdCard {
     }
 
     fn load_sector(&mut self, sector: u64) {
+        self.sectors_read += 1;
         let mut buf = [0u8; SD_SECTOR_SIZE];
         self.backing.read_sector(sector, &mut buf);
         self.curr_sector_crc = sd_crc16(&buf);
@@ -265,9 +291,9 @@ impl SpiSdCard {
                     self.state = SdState::WritingSingleBlock { sector, offset, buf };
                 } else {
                     // Second CRC byte received; commit sector write to storage
+                    self.sectors_written += 1;
                     self.backing.write_sector(sector, &buf);
                     self.rx_queue.push_back(0x05); // Data accepted token (0b00000101)
-                    self.rx_queue.push_back(0xFF); // Not busy
                     self.state = SdState::Ready;
                 }
                 0xFF
@@ -278,7 +304,6 @@ impl SpiSdCard {
                         offset = 1;
                         self.state = SdState::WritingMultiBlock { sector, offset, buf };
                     } else if mosi == 0xFD {
-                        self.rx_queue.push_back(0xFF);
                         self.state = SdState::Ready;
                     } else {
                         self.state = SdState::WritingMultiBlock { sector, offset, buf };
@@ -291,9 +316,9 @@ impl SpiSdCard {
                     offset += 1;
                     self.state = SdState::WritingMultiBlock { sector, offset, buf };
                 } else {
+                    self.sectors_written += 1;
                     self.backing.write_sector(sector, &buf);
                     self.rx_queue.push_back(0x05); // Data accepted token
-                    self.rx_queue.push_back(0xFF); // Not busy
                     self.state = SdState::WritingMultiBlock { sector: sector + 1, offset: 0, buf };
                 }
                 0xFF
@@ -580,5 +605,56 @@ mod tests {
         let mut read_buf = [0u8; SD_SECTOR_SIZE];
         sd.backing.read_sector(7, &mut read_buf);
         assert_eq!(read_buf, write_data);
+    }
+
+    #[test]
+    fn test_spi_sd_multi_block_write() {
+        let mem = MemoryStorage::new(1024 * 1024);
+        let mut sd = SpiSdCard::new(Box::new(mem));
+        sd.set_cs(true);
+        sd.state = SdState::Ready;
+
+        // Send CMD25 for sector 10: [0x59, 0x00, 0x00, 0x00, 0x0A, 0xFF]
+        let cmd25 = [0x59, 0x00, 0x00, 0x00, 0x0A, 0xFF];
+        for &b in &cmd25 {
+            sd.transfer_byte(b);
+        }
+        let resp = sd.transfer_byte(0xFF);
+        assert_eq!(resp, 0x00, "CMD25 should return R1 0x00");
+
+        // Block 1: Start token 0xFC, 512 bytes of 0xAA, 2 dummy CRC bytes
+        sd.transfer_byte(0xFC);
+        let block1 = [0xAAu8; SD_SECTOR_SIZE];
+        for &b in &block1 {
+            sd.transfer_byte(b);
+        }
+        sd.transfer_byte(0x00);
+        sd.transfer_byte(0x00);
+        let accepted1 = sd.transfer_byte(0xFF);
+        assert_eq!(accepted1, 0x05, "Block 1 data accepted token");
+
+        // Block 2: Start token 0xFC, 512 bytes of 0xBB, 2 dummy CRC bytes
+        sd.transfer_byte(0xFC);
+        let block2 = [0xBBu8; SD_SECTOR_SIZE];
+        for &b in &block2 {
+            sd.transfer_byte(b);
+        }
+        sd.transfer_byte(0x00);
+        sd.transfer_byte(0x00);
+        let accepted2 = sd.transfer_byte(0xFF);
+        assert_eq!(accepted2, 0x05, "Block 2 data accepted token");
+
+        // Stop transmission with Stop Tran Token 0xFD
+        sd.transfer_byte(0xFD);
+        let ready = sd.transfer_byte(0xFF);
+        assert_eq!(ready, 0xFF, "Ready after Stop Tran");
+
+        // Verify sectors 10 and 11
+        let mut r10 = [0u8; SD_SECTOR_SIZE];
+        let mut r11 = [0u8; SD_SECTOR_SIZE];
+        sd.backing.read_sector(10, &mut r10);
+        sd.backing.read_sector(11, &mut r11);
+        assert_eq!(r10, block1);
+        assert_eq!(r11, block2);
     }
 }

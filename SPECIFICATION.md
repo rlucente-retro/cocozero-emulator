@@ -362,7 +362,9 @@ Before audio samples enter the 8,192-sample SPSC ring buffer, they pass through 
 
 In the host emulator, digital audio is routed to host speakers through the SDL2 audio pipeline:
 - **Audio Queue Specification:** Configured for 48,000 Hz sample rate, 2-channel stereo, 16-bit signed integer format (`AudioFormat::S16LSB`), and a 1,024-sample hardware buffer.
-- **Latency & Overflow Protection:** The host queue enforces a bounded maximum size ($48,000 \times 2 \times 2\text{ bytes}$) to discard stale frames and maintain low audio latency across long execution sessions.
+- **Latency & Overflow Protection:** The host queue enforces a bounded maximum size (19,200 bytes, ~100 ms of 48 kHz 16-bit stereo PCM) via `AUDIO_QUEUE_MAX_BYTES` to prevent latency runaway and maintain tight audio-video synchronization across long execution sessions and under `--turbo` acceleration.
+- **Ring Buffer Extraction (`extract_audio`):** In physical hardware, digital audio is drained from the SPSC audio ring buffer (`AUDIO_RING_SAMPLES = 8192`) by Core 1 in its TMDS DMA ISR (`coco_machine_audio_read`). In the host emulator, `CoCoZeroSoC::extract_audio()` drains pending mono 48 kHz samples from `g_audio_ring` (`0x2001_80C4`), duplicates each sample into interleaved stereo pairs `[L, R]`, advances the host read index `host_audio_r`, and synchronizes `g_audio_r` (`0x2004_B89C`) in firmware SRAM to preserve firmware diagnostic telemetry (`coco_machine_audio_stats`).
+- **Overflow & Lapping Recovery:** If the producer laps the consumer ($w - r > 8,192$), `extract_audio()` skips ahead to $w - 8,192$ and drains the most recent 8,192 samples, preventing stale audio playback while maintaining seamless continuity.
 
 ---
 

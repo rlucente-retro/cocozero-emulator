@@ -9,3 +9,8 @@ tests/*.bmp
 *.dsk
 coco/roms/*.rom
 coco/dsk/*.dsk
+
+# Emulator runtime state
+coco/drives.txt
+coco/log/
+

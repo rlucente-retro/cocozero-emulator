@@ -20,7 +20,7 @@ pub const SPI1_DR: u32 = SPI1_BASE + 0x08;
 pub const SPI1_SR: u32 = SPI1_BASE + 0x0C;
 
 pub const UART0_BASE: u32 = 0x4007_0000;
-pub const UART0_DR: u32 = UART0_BASE + 0x00;
+pub const UART0_DR: u32 = UART0_BASE;
 
 pub struct CoCoBus<'a> {
     pub bus: &'a mut Bus,
@@ -89,17 +89,13 @@ impl<'a> CoCoBus<'a> {
                 // GPIO_HI_OUT direct write
                 self.sd.set_cs((val & cs_bit) == 0);
             }
-            0xD000_001C => {
+            0xD000_001C if (val & cs_bit) != 0 => {
                 // GPIO_HI_OUT_SET: 1 sets pin high -> CS deasserted
-                if (val & cs_bit) != 0 {
-                    self.sd.set_cs(false);
-                }
+                self.sd.set_cs(false);
             }
-            0xD000_0024 => {
+            0xD000_0024 if (val & cs_bit) != 0 => {
                 // GPIO_HI_OUT_CLR: 1 sets pin low -> CS asserted
-                if (val & cs_bit) != 0 {
-                    self.sd.set_cs(true);
-                }
+                self.sd.set_cs(true);
             }
             _ => {}
         }
@@ -125,7 +121,7 @@ impl<'a> CoreBus for CoCoBus<'a> {
         }
 
         // 2. Intercept SPI1 registers (0x40084000..=0x40084020)
-        if addr >= SPI1_BASE && addr <= (SPI1_BASE + 0x20) {
+        if (SPI1_BASE..=(SPI1_BASE + 0x20)).contains(&addr) {
             return self.read_spi1(addr);
         }
 
@@ -151,7 +147,7 @@ impl<'a> CoreBus for CoCoBus<'a> {
         }
 
         // 2. Intercept SPI1 registers
-        if addr >= SPI1_BASE && addr <= (SPI1_BASE + 0x20) {
+        if (SPI1_BASE..=(SPI1_BASE + 0x20)).contains(&addr) {
             self.write_spi1(addr, val);
             return;
         }
