@@ -73,9 +73,10 @@ The emulator dynamically packages the `./coco/` host directory into a virtual FA
 ```text
 coco/
 ├── roms/           # Color BASIC system ROMs (user-supplied)
-│   ├── bas12.rom       # Color BASIC 1.2 (required)
+│   ├── bas12.rom       # Color BASIC 1.2 (required for CoCo 2)
 │   ├── extbas11.rom    # Extended Color BASIC 1.1 (optional)
-│   └── disk11.rom      # Disk BASIC 1.1 (optional)
+│   ├── disk11.rom      # Disk BASIC 1.1 (optional)
+│   └── coco3.rom       # Super Extended Color BASIC 2.1 (required for CoCo 3)
 ├── dsk/            # Floppy disk images (.dsk) -> mount via F12
 ├── cart/           # ROM cartridges (.ccc / .rom) -> mount via F10
 ├── bin/            # Machine language binaries (.bin) -> load via F9 or LOADM
@@ -86,9 +87,10 @@ coco/
 
 > **Important Note on System ROMs:**
 > Due to copyright restrictions, proprietary Color Computer ROM files are **not distributed** with this repository. You must provide your own ROM files in `coco/roms/` before starting the emulator:
-> - `bas12.rom`: Tandy Color BASIC 1.2 (8192 bytes, required)
+> - `bas12.rom`: Tandy Color BASIC 1.2 (8192 bytes, required for CoCo 2)
 > - `extbas11.rom`: Extended Color BASIC 1.1 (8192 bytes, optional)
 > - `disk11.rom`: Disk Extended Color BASIC 1.1 (8192 bytes, optional)
+> - `coco3.rom`: Super Extended Color BASIC 2.1 (32768 bytes, required for CoCo 3)
 
 - **Disks (`coco/dsk/`):** Place your `.dsk` floppy images here. Press **F12** in the emulator to open the disk mount menu.
 - **Cartridges (`coco/cart/`):** Place `.ccc` cartridge images here. Press **F10** to open the cartridge selector.
@@ -148,6 +150,9 @@ cargo run --release -- --headless -f 200 --script tests/test_script.txt --teleme
 
 # Direct command typing: run a calculation and exit
 cargo run --release -- --headless -f 180 --type "PRINT 100*42\n"
+
+# Launch 128 KB Tandy Color Computer 3 (Super Extended Color BASIC 2.1)
+cargo run --release -- --uf2 roms/cocozero-coco3.uf2 --elf roms/cocozero-coco3.elf --turbo 6
 ```
 
 ---
