@@ -4,7 +4,7 @@
 **Emulated System:** Tandy Color Computer 2 (CoCo 2) with SAM double-speed and selective CoCo 3 enhancements (plus experimental 128 KB CoCo 3 firmware)  
 **Reference Firmware:** [ugufru/xroar-waveshare-rp2350-pizero](https://github.com/ugufru/xroar-waveshare-rp2350-pizero)  
 **Host Hardware Emulator:** `cocozero-rp2350` (Rust / SDL2 / `rp2350-emu`)  
-**Document Version:** 1.3.0  
+**Document Version:** 1.4.0  
 **Status:** Validated Technical Specification & System Reference  
 
 ---
@@ -504,6 +504,24 @@ The firmware auto-detects and decodes multiple standard gamepad protocols:
   - M Button (GameSir): Captures screenshot to SD card.
 - **Overlay Menu Controls on Gamepad:** When an OSD menu is open, the D-pad navigates (left/right switches menu categories), **A** selects/starts the highlighted game, **B** closes the menu, **L1/R1** page up/down, and **X** opens the built-in text editor on the highlighted game's `.TXT` configuration file.
 
+### 5.5 Multi-Source Keyboard Matrix Layering
+
+To support concurrent input from multiple physical and virtual sources without key drops or release contention (PIZERO-163), the keyboard matrix architecture maintains three completely isolated $8 \times 8$ active-low matrix layers (`COCO_KEY_SOURCES = 3`):
+
+| Source ID | Source Identifier | Origin / Subsystem | Contract & Description |
+|---|---|---|---|
+| **0** | `COCO_KEYS_USB` | USB HID Keyboard (`TinyUSB`) | Real-time keystrokes from physical USB keyboards. |
+| **1** | `COCO_KEYS_TYPED` | USB CDC / Serial / Autorun Typer | Text streamed over serial CDC or script-driven autotype buffers. |
+| **2** | `COCO_KEYS_PAD` | Gamepad Button-to-Matrix | Gamepad button mappings translating to keyboard inputs (e.g. Space, Enter). |
+
+- **Matrix Combination Contract:**  
+  Each source maintains an independent 8-byte array `g_kb_src[source][column]` initialized to `0xFF` (all keys released). The effective active-low matrix presented to PIA0 is the continuous bitwise AND across all layers:
+  $$\text{g\_kb\_col\_row\_mask}[\text{col}] = \bigwedge_{s=0}^{\text{COCO\_KEY\_SOURCES}-1} \text{g\_kb\_src}[s][\text{col}]$$
+- **Key State Isolation Invariant:**  
+  A matrix intersection is asserted (`0`, active-low) whenever *any* active source holds it pressed. Releasing a key or clearing an input buffer on one source (for example, the serial autotype engine finishing a script or releasing a typed spacebar) can never clear, drop, or interrupt a key held down by another source (such as a user holding the Shift key, Break key, or cursor arrows on a USB keyboard).
+- **Global Matrix Clearing Contract:**  
+  Global release requests (`coco_machine_release_all_keys()`) reset all three layers simultaneously to `0xFF`. This contract is executed strictly during cold-reset and reboot boundaries.
+
 ---
 
 ## 6. Storage & Filesystem Subsystem Specification
@@ -585,6 +603,13 @@ The system emulates a Western Digital **WD2797 / WD1793** Floppy Disk Controller
 - **NitrOS-9 Level 1 OS-9 Boot Support (PIZERO-190, 191, 194, 199):** The floppy subsystem supports booting NitrOS-9 Level 1 operating system disks using Disk BASIC's `DOS` command. Full filesystem write operations and command execution persist reliably across power cycles.
 - **Drive Persistence:** Drive assignments are automatically preserved across power cycles in `/coco/drives.txt`.
 
+#### Floppy Controller Hardware Contracts (PIZERO-66, PIZERO-114)
+- **Two-Stage Sector Write Protocol:** When the 6809 issues a WD2797 Write Sector command, the sector write callback is invoked in two distinct phases:
+  1. *Pre-flight Write Protection Check (`in256 == NULL`):* The physical WD2797 Floppy Disk Controller samples drive write-protection status at the onset of command issuance, prior to receiving sector data bytes from the CPU. The callback must verify write eligibility and return `0` if writable, or `COCO_DISK_WRITE_PROTECT` (or `COCO_DISK_NOT_READY`) to abort the command immediately. If no write callback is registered, all drives are treated as strictly write-protected.
+  2. *Data Payload Commit:* Once the CPU has written the full 256-byte sector payload into the controller data register, the callback is invoked with the data pointer. It commits the sector to the backing `.dsk` file on microSD and returns `0` on success.
+- **Spindle Motor Shutoff & Idle Cache Flush:** The `$FF40` drive latch register bit 3 controls the drive spindle motor (`1` = motor energized, `0` = motor stopped). Disk operating systems (Color Disk BASIC and NitrOS-9) maintain motor activation during active operations and de-energize the motor (clearing bit 3) approximately 1 to 2 seconds after the final disk access. A high-to-low transition (`1 -> 0`) of bit 3 triggers the disk idle callback (`coco_disk_idle_fn`), prompting the host to commit pending sector writes, update FAT directory structures, and flush filesystem buffers to the physical card. This decoupled flush contract ensures write durability without introducing latency during high-speed sequential sector transfers.
+- **Active Drive Tracking:** The drive select bits written to `$FF40` (bits 0–1, selecting drives 0–3) are continuously tracked (`coco_machine_fdc_drive()`). When opening the `< DISKS >` OSD menu via **F12**, the menu interface automatically focuses on the drive index last targeted by the guest operating system.
+
 #### RS-DOS Directory Scanning (`rsdos_dir.h`)
 When a disk is selected for launch in Drive 0:
 - The firmware scans Track 17, Sectors 3 through 11 (8 directory entries of 32 bytes per sector).
@@ -595,11 +620,12 @@ When a disk is selected for launch in Drive 0:
 ### 6.4 Cartridge & Binary Loading Engine
 
 - **Direct Binary Loading (`.bin`):** Color BASIC `LOADM` binary parsing (`coco_boot_parse_loadm`). Loads multi-segment headers directly into RAM and executes via direct Program Counter (PC) jump without requiring Disk BASIC.
-- **ROM Cartridges (`.ccc`):**
-  - Standard Cartridges: 2 KB, 4 KB, 8 KB, and 16 KB ROMs mapped into `$C000–$DFFF` (mirrored through `$E000–$FEFF`). Small cartridges repeat through the address window.
-  - Bank-Switched GMC Cartridges: 32 KB to 256 KB banked ROMs (16 KB per bank, up to 16 banks). Bank switching triggered by guest writes to even addresses in `$FF40–$FF5F`:
+- **Simple Sized Cartridges (`.ccc`):** Supports ROM cartridges of 2 KB, 4 KB, 8 KB, and 16 KB (power-of-two sizes) mapped into `$C000–$DFFF` and mirrored through `$E000–$FEFF`. Cartridges smaller than 16 KB repeat across the address window, faithfully matching physical cartridge hardware where upper address lines are left unbonded.
+- **Bank-Switched GMC Cartridges (`.ccc`):** Supports extended bank-switched cartridges from 32 KB up to 256 KB (power-of-two sizes, 16 KB per bank, up to 16 banks), booting into bank 0. Bank selection is controlled dynamically:
+  - *Even I/O addresses in `$FF40–$FF5F`:* Writes to even addresses switch the active 16 KB bank at `$C000–$FEFF`:
     $$\text{bank\_offset} = (D \ll 14) \ \& \ ((\text{len} - 1) \ \& \ \text{0x3C000})$$
-    Odd addresses in `$FF40–$FF5F` route to the SN76489 sound chip.
+  - *Odd I/O addresses in `$FF40–$FF5F`:* Writes to odd addresses bypass bank switching and route sound data to the onboard SN76489 Complex Sound Generator (CSG).
+- **Standalone SN76489 Sound Chip Mapping (`$FF41`):** Even when no Games Master Cartridge is installed, the SN76489 sound chip is directly accessible at `$FF41` (the odd mirrors of the floppy disk latch `$FF40`) when enabled via `sn76489 = on` (default). Setting `sn76489 = off` disables sound chip decoding, returning `$FF41` to standard floppy latch decoding.
 - **Screenshot Writer (`png_write.h`):** Saves $320 \times 240$ 8-bit indexed PNG images using uncompressed (STORED) deflate blocks directly to `/coco/shots/SCR0001.PNG` through `SCR9999.PNG`. Consumes ~77 KB per image without requiring heap-heavy zlib compression buffers.
 - **Autorun Script Delay Tokens (`~`):** In `autorun.txt`, the `~` character introduces a 1.0-second delay per token, allowing operating systems like NitrOS-9 time to complete device driver initialization before typing subsequent commands.
 
@@ -625,7 +651,7 @@ The guest emulation core is adapted from [XRoar](https://www.6809.org.uk/xroar/)
 |  $E000 - $FEFF    ROM Mirror / Cart Mirror     ROM (8 KB)   RAM         |
 |  $FF00 - $FF1F    MC6821 PIA0 (Kbd / Joy / HS) I/O Ports    I/O Ports   |
 |  $FF20 - $FF3F    MC6821 PIA1 (DAC / VDG / FS) I/O Ports    I/O Ports   |
-|  $FF40 - $FF5F    WD2797 FDC / SN76489 CSG     I/O Ports    I/O Ports   |
+|  $FF40 - $FF5F    WD2797 FDC / CSG / Bank Sw   I/O Ports    I/O Ports   |
 |  $FF90 - $FF95    CoCo 3 GIME Timers & IRQs    Optional     Optional    |
 |  $FFB0 - $FFBF    CoCo 3 GIME Palette (16 RGB) Optional     Optional    |
 |  $FFC0 - $FFDF    MC6883 SAM Control Registers SAM Regs     SAM Regs    |
@@ -638,8 +664,8 @@ The guest emulation core is adapted from [XRoar](https://www.6809.org.uk/xroar/)
    - The lower 32 KB ($0000–$7FFF) is continuously mapped to dynamic RAM.
    - Addresses $8000–$BFFF map the 16 KB Color BASIC system ROM (Extended BASIC 1.1 at $8000–$9FFF; Color BASIC 1.2 at $A000–$BFFF).
    - Addresses $C000–$DFFF map external cartridge ROM (such as Disk BASIC 1.1 or games).
-   - Addresses $E000–$FEFF mirror the cartridge/BASIC ROM window.
-   - Hardware I/O and control registers occupy the top 256 bytes ($FF00–$FFFF).
+   - Addresses $E000–$FEFF mirror the cartridge/BASIC ROM window (or upper 8 KB of a 16 KB cartridge).
+   - Hardware I/O and control registers occupy the top 256 bytes ($FF00–$FFFF). Specifically, even addresses in `$FF40–$FF5F` decode to the WD2797 FDC registers and cartridge bank-switch latches, while odd addresses (specifically `$FF41`) route to the SN76489 sound chip when enabled.
 2. **All-RAM Operating Mode ($TY=1$):**
    - When the SAM $TY$ register is set (`POKE 65499,0` or write to `$FFDF`), the entire 64 KB address space from `$0000` through `$FEFF` is mapped to contiguous dynamic RAM.
    - Only the upper 256 bytes (`$FF00–$FFFF`) remain reserved for I/O registers and hardware interrupt vectors.
@@ -910,7 +936,12 @@ The Color Computer 2 incorporates two Motorola **MC6821** Peripheral Interface A
 
 The repository includes a dedicated build environment, **`pizero_coco3`** (PIZERO-133), providing full bare-metal emulation of a 128 KB Tandy Color Computer 3:
 - **System ROM:** Requires the 32 KB CoCo 3 ROM image (`coco3.rom`) located in `/coco/roms/coco3.rom` (Super Extended Color BASIC).
-- **Memory Architecture:** Models 128 KB of unified system RAM partitioned into sixteen 8 KB blocks mapped via the CoCo 3 MMU.
+- **Physical Hardware Scope & 128 KB Memory Limit (PIZERO-111, PIZERO-228):**
+  - The Waveshare RP2350-PiZero PCB features an unpopulated PSRAM pad, restricting the system strictly to the RP2350B's internal 520 KB SRAM.
+  - CoCo 3 emulation on this board is strictly a **128 KB machine**. A 512 KB CoCo 3 requires 448 KB of additional RAM, which cannot fit within on-chip SRAM alongside the display framebuffer (~153.6 KB) and firmware infrastructure (firmware static + buffers ~400 KB = ~76.3% of 520 KB). Populating physical external PSRAM would be required for 512 KB support.
+- **512 KB Software Execution & Memory Wrapping Mechanics:**
+  - *Explicit Checks:* Software with built-in memory detection routines (e.g. *Golaxian*) queries available banks and cleanly reports `512K REQUIRED, 128K DETECTED` before halting.
+  - *Blind Bank Mapping:* Titles that blindly map 512 KB memory banks (e.g. *Montezuma's Revenge*, *Sinistar preview*) map MMU pages outside the 128 KB boundary. On 128 KB hardware, 8 KB logical page indices wrap modulo 16 onto physical RAM. For example, in *Montezuma's Revenge*, loader routines set MMU slot `$FFA2` (`$4000–$5FFF`) to pages `$08`–`$11`; on 128 KB, page `$08` wraps to `$38`, aliasing Disk BASIC's workspace in `$0000–$1FFF` and causing disk load routines to abort with `?IE ERROR` or system lockups, matching authentic physical 128 KB CoCo 3 behavior.
 - **GIME Chip Emulation (`tcc1014.c`):** Adapts the full XRoar GIME ASIC model to govern memory management, programmable interrupt timers, palette registers, and video generation.
 - **MMU Paged Fast Path (`COCO_FASTBUS_PAGES`, PIZERO-213):** Employs an inlined page table that resolves physical 8 KB memory pages directly in the 6809 core, preserving high instruction throughput despite dynamic MMU remapping.
 - **Port-Side GIME Scanline Renderer (PIZERO-218):**
@@ -920,7 +951,11 @@ The repository includes a dedicated build environment, **`pizero_coco3`** (PIZER
 - **Performance Characteristics (PIZERO-219, PIZERO-220):**
   - Runs at locked 60.0 fps at both 0.895 MHz and 1.789772 MHz (`POKE 65497,0`).
   - Full-screen high-speed animations (HCLS loops at 1.79 MHz) execute in ~12.9 ms median (15.2 ms worst-case), maintaining full 60.0 fps with zero late frames and 0% audio shortfall.
-- **Video Modes & Status:** Supports 32- and 40-column text modes and 256- and 320-pixel graphics (HSCREEN 0–2). 640-pixel wide modes (80-column text) are currently downscaled to 320 pixels (PIZERO-134); ALT, CTRL, F1, and F2 keys are pending mapping (PIZERO-215).
+- **Display Scanout & 640-Wide Mode Constraints (PIZERO-134):**
+  - Supports 32- and 40-column text modes and 256- and 320-pixel graphics (HSCREEN 0–2).
+  - A full 640-pixel wide RGB565 framebuffer ($640 \times 240 \times 2 = 307,200\text{ bytes}$) exceeds available free SRAM.
+  - Consequently, 640-pixel wide video modes (including 80-column text mode `WIDTH 80` and 640-wide graphics) are currently downscaled into the 320-pixel framebuffer via horizontal decimation, rendering 80-column text unreadable until a dedicated line-by-line rasterization path (`dvi_scanbuf_main_16bpp`) is implemented.
+- **Keyboard Mappings:** ALT, CTRL, F1, and F2 keys are pending mapping (PIZERO-215).
 
 ---
 
@@ -951,42 +986,62 @@ Accessible via **F11** or by pressing **TAB** on any highlighted game in the F9/
 
 ### 8.3 Configuration System (`settings.txt` & Per-Game `.TXT`)
 
-Settings are plain text key-value pairs stored in `/coco/settings.txt`:
+Configuration is managed via plain-text key-value files on the microSD card. The system requires no dedicated settings GUI; configuration is modified directly via text files, either on a PC or using the integrated on-screen text editor (**F11** or **TAB**).
+
+#### Configuration Loading Hierarchy
+1. **Global Configuration (`/coco/settings.txt`):** Loaded at system power-on and machine cold-reset to establish platform baseline defaults.
+2. **Companion Per-Game Overrides (`<GAME>.TXT`):** Any disk image, program binary, or cartridge can provide a companion configuration file located in the same directory sharing the exact base name (e.g. `/coco/bin/ORBIT.TXT` for `/coco/bin/ORBIT.BIN`, or `/coco/dsk/SPACE-RAID.TXT` for `/coco/dsk/SPACE-RAID.DSK`).
+   - When a title is launched (via OSD menu or autorun), the system reloads `settings.txt` first, and then applies the companion `<GAME>.TXT` on top.
+   - Companion files only need to specify parameters that differ from global defaults (e.g. title-specific button maps, artifact phase, low-pass filter frequency, or custom palette colors).
+   - Launching a title without a companion file restores standard `settings.txt` behavior.
+3. **Interactive Configuration Editing (**TAB** Key):**
+   - Highlighting any title in the OSD lists (**F9** Programs, **F10** Cartridges, **F12** Disks) and pressing **TAB** opens the built-in text editor directly on that title's companion `.TXT` file, automatically initializing a template if absent.
+   - Saving via **Ctrl-S** commits changes atomically (`.tmp` $\rightarrow$ `.txt`) and immediately updates the live configuration if that title is running.
+
+#### Configuration Keys & Parameter Matrix
+
 ```ini
 # /coco/settings.txt
-sn76489           = on        # Enable SN76489 sound chip at $FF41
-volume            = 10        # Global audio volume (0-15; 6x gain boost over early builds)
-audio_lowpass     = 8000      # 2-pole Butterworth low-pass filter (1000-20000, on=8000, off)
+sn76489           = on        # SN76489 sound chip at $FF41 (on / off)
+volume            = 10        # Global audio volume (0-15; 10 = standard default)
+audio_lowpass     = 8000      # 2-pole Butterworth low-pass filter (1000-20000 Hz, on=8000, off)
 artifact_colors   = on        # PMODE 4 NTSC color artifacts (on / off / swapped)
-gime_palette      = on        # CoCo 3 palette registers at $FFB0-$FFBF
-gime_timer        = on        # CoCo 3 timer/interrupts at $FF90-$FF95
-autorun           = on        # Automatically run disk or autorun.txt on boot
-reset_button      = basic     # RUN button action: 'basic' (prompt) or 'autorun'
-serial_keyboard   = on        # Accept serial keystrokes over USB-CDC
-joystick_swap     = off       # Swap left/right gamepad sticks
-font              = 6847t2    # Font set: classic / 6847t1 / 6847t2
-lowercase         = on        # True lowercase display
-key_repeat        = on        # Keyboard auto-repeat
-key_repeat_delay  = 500       # Repeat delay in milliseconds
-key_repeat_rate   = 10        # Repeats per second (1-12)
+gime_palette      = on        # CoCo 3 palette registers at $FFB0-$FFBF (on / off)
+gime_timer        = on        # CoCo 3 timer/interrupts at $FF90-$FF95 (on / off)
+autorun           = on        # Automatically run disk or autorun.txt on boot (on / off)
+reset_button      = basic     # Board RUN button action: 'basic' (prompt) or 'autorun'
+serial_keyboard   = on        # Accept serial keystrokes over USB-CDC (on / off)
+joystick_swap     = off       # Swap left and right gamepad sticks (on / off)
+font              = 6847t2    # Text font: classic / 6847t1 / 6847t2
+lowercase         = on        # True lowercase font rendering (on / off)
+key_repeat        = on        # Keyboard auto-repeat (on / off)
+key_repeat_delay  = 500       # Key hold delay before repeating (100-2000 ms)
+key_repeat_rate   = 10        # Repeats per second (1-30, clamped to max 12)
 video_encoder     = hardware  # TMDS encoder: hardware (SIO) / software
-soak_log          = off       # Standalone minute-by-minute soak telemetry to /coco/log/
+soak_log          = off       # Standalone minute-by-minute soak telemetry to /coco/log/ (on / off)
 dpad              = joystick  # Gamepad D-pad mode: joystick / arrows
-pad_start         = enter     # Gamepad button mapping
+pad_start         = enter     # Gamepad button mapping (fire, fire_right, none, or key name)
 ```
 
-**Per-Game Custom Configurations:** Any game can have an accompanying `.TXT` file in the same directory (e.g. `/coco/bin/ORBIT.TXT` for `/coco/bin/ORBIT.BIN`). When launching, `settings.txt` is loaded first, followed by the game's `.TXT` file on top, allowing per-game button remapping, artifact phases, or custom palettes. Pressing **TAB** in any OSD list instantly opens the editor for that title's `.TXT` file.
+- **Case-Insensitive Parsing:** Key names and boolean values (`on`/`off`, `yes`/`no`, `1`/`0`, `true`/`false`) are fully case-insensitive.
+- **Palette Customization:** Any of the 6847 VDG default colors can be overridden via `color_<NAME> = #RRGGBB` (e.g. `color_green = #1ED01E`, `color_dark_green = #0A3C0A`). Overridden colors take effect immediately and are restored upon reset.
+- **Gamepad Button Rebinding:** Every physical button on a USB gamepad can be individually bound via `pad_bottom`, `pad_right`, `pad_left`, `pad_top`, `pad_l1`, `pad_r1`, `pad_l2`, `pad_r2`, `pad_select`, `pad_start`, `pad_l3`, `pad_r3` to `fire`, `fire_right`, `none`, or an emulated CoCo key (`space`, `enter`, `clear`, `break`, `shift`, `up`, `down`, `left`, `right`, letters, digits, or symbols).
 
 ### 8.4 Autorun Automation (`autorun.txt`)
 
-If `autorun = on`, `/coco/autorun.txt` is evaluated at boot:
-- `# comment`: Comment line.
-- `@CART <filename.ccc>`: Automatically mounts the specified cartridge and boots.
-- `@DIRECT <filename.bin>`: Direct-loads binary into RAM and executes immediately.
-- `<BASIC commands>`: Types commands line-by-line into the BASIC interpreter (e.g. `LOADM"GAME":EXEC`).
-- `~`: Pause delay token. Each `~` pauses typing by **1.0 second**, allowing disk operating systems (such as NitrOS-9 booting via `DOS`) sufficient time to complete initialization before commands are executed.
-- Default (if `autorun.txt` is absent): Automatically mounts the first disk in `/coco/dsk/` and runs its first program.
-- Bypass: Holding **Space** or **Break** during boot skips autorun and halts at the BASIC `OK` prompt.
+When enabled (`autorun = on`), the system automates software startup immediately upon boot:
+- **Execution Workflow:**
+  1. If `/coco/autorun.txt` is present on the SD card, its directives are evaluated sequentially.
+  2. If `/coco/autorun.txt` is absent, the firmware automatically scans Track 17 of Drive 0 (the last mounted disk, preserved across power cycles in `/coco/drives.txt`), identifies the first executable file (`.BAS` or `.BIN`), and synthesizes the launch command (`RUN"NAME"` or `LOADM"NAME":EXEC`).
+- **Directives Syntax (`autorun.txt`):**
+  - `# <comment>`: Comments and empty lines are ignored.
+  - `@CART <filename.ccc>`: Mounts the designated cartridge from `/coco/cart/` and cold-boots into it.
+  - `@DIRECT <filename.bin>`: Directly writes machine code from `/coco/bin/` into RAM and jumps to the execution address (`coco_machine_loadm_write` and `coco_machine_jump`), bypassing BASIC entirely.
+  - `<Text Line>`: Streams ASCII keystrokes directly into the Color BASIC interpreter.
+  - `~` Pause Token: Each `~` character introduces a **1.0-second delay** in keystroke delivery. This allows operating systems like NitrOS-9 (booted via `DOS`) sufficient time to complete multi-second disk driver and subsystem initialization before executing subsequent script lines.
+- **Autorun Bypass & Recovery:**
+  - *Interactive Bypass:* Holding or tapping **Space** or **Break / Esc** during power-on aborts autorun sequencing and drops the machine into the standard Color BASIC `OK` prompt.
+  - *RUN Button Reset Behavior (`reset_button`):* Setting `reset_button = basic` (default) configures the physical board RUN/reset button to abort autorun and return to the BASIC prompt, ensuring a reliable recovery mechanism if guest software hangs. Setting `reset_button = autorun` forces the reset button to re-execute autorun.
 
 ---
 
