@@ -192,7 +192,7 @@ The host emulator (`cocozero-rp2350`) operates at **Tier 4** of the architecture
 - **Simulation Turbo Multiplier (`--turbo <N>`):**
   - Scales the per-frame virtual cycle slice: $\text{Cycles per frame} = \frac{252,000,000 / 60}{N}$.
   - *Performance Tradeoff:* Simulating 252,000,000 cycles/sec across dual cores in software can exceed real-time budgets on host CPUs. At `--turbo 6`, virtual frame execution achieves real-time 60.0 FPS on standard desktop and laptop processors.
-  - *Timing Invariance:* Internal keyboard matrix debouncing, hold countdowns, and gap delays are dynamically multiplied by $N$ ($4 \times T$ hold, $2 \times T$ gap), preserving correct virtual-time latching inside Color BASIC regardless of host simulation speed.
+  - *Timing Invariance:* Internal keyboard matrix debouncing, hold countdowns, and gap delays are dynamically scaled by $N$ to guarantee that every keystroke spans across at least one full 60 Hz vertical blank keyboard scan interrupt (> 4,200,000 cycles), preserving reliable virtual-time latching inside Color BASIC regardless of host simulation speed.
 
 ---
 
@@ -288,8 +288,8 @@ The product build incorporates revised horizontal blanking parameters (`8/92/60`
 
 The host emulator bridges RP2350 SRAM video generation to modern host display servers using SDL2:
 - **Dynamic Symbol Resolution:** To accommodate upstream firmware rebuilds without recompiling the emulator, the engine automatically extracts critical symbol addresses at startup via `FirmwareSymbols`:
-  1. *Companion ELF Analysis:* If a companion ELF file exists (`roms/cocozero.elf` or `--elf <PATH>`), the emulator parses the 32-bit ELF symbol table (`.symtab`), extracting `_ZL4g_fb`, `_ZL17g_kb_col_row_mask`, `_ZL5g_ovk`, and `tuh_hid_report_received_cb` in < 1 ms.
-  2. *In-Flash Signature Scanning:* If only raw UF2 flash data is supplied, the engine scans the flash image for invariant opcode and literal pool signatures.
+  1. *Companion ELF Analysis:* If a companion ELF file exists (matching the UF2 filename stem, e.g. `roms/cocozero-coco3.elf`, default `roms/cocozero.elf`, or explicit `--elf <PATH>`), the emulator parses the 32-bit ELF symbol table (`.symtab`), extracting `_ZL4g_fb`, `_ZL17g_kb_col_row_mask`, `_ZL5g_ovk`, and `tuh_hid_report_received_cb` in < 1 ms.
+  2. *In-Flash Signature Scanning:* If no matching ELF file is supplied or found, the engine scans the flash image for invariant opcode and literal pool signatures, distinguishing between CoCo 2 (`0x2000_B304`) and CoCo 3 (`0x2000_F200`) builds before falling back to default tables.
   3. *Fallback / User Override:* If symbols cannot be discovered, defaults are used (`0x2002_2900`), and users can override explicitly via `--fb-addr <ADDR>`.
 - **Extraction Mechanism:** Each simulated frame quantum, `extract_frame()` reads 32-bit words from SRAM offset, unpacking them into a host-side array of $320 \times 240$ 16-bit RGB565 pixels (153,600 bytes).
 - **SDL2 Presentation:** The extracted frame locks an SDL2 streaming texture (`PixelFormatEnum::RGB565`), presenting it on a centered $640 \times 480$ window at 60 Hz.
@@ -428,22 +428,24 @@ Host SDL2 Window / Non-blocking Terminal Stdin
          |                       |
          v                       v
 Tier 1: Matrix Engine   Tier 2: TinyUSB HID Callback
-  * SRAM 0x2000B304       * Report at 0x2001C18C
-  * kt_chord() Table      * Trampoline at 0x2007FFE0
-  * Virtual Hold (4f*T)   * HID Callback 0x1001F460
-  * Virtual Gap (2f*T)    * Register Save / Restore
-  * Boot Gated (630M cyc) * Direct Menu Navigation
+  * SRAM Matrix Address   * Report at 0x2001C18C
+    (0x2000B304/0x2000F200) * Trampoline at 0x2007FFE0
+  * kt_chord() Table      * HID Callback 0x1001F460
+  * Virtual Hold (T + 1)  * Register Save / Restore
+  * Virtual Gap (2T/3)    * Direct Menu Navigation
+  * Boot Gated by cycles  |
+    (CoCo 2: 150f, CoCo 3: 210f)
          |                       |
          v                       v
 Guest 6809 Color BASIC   Firmware OSD Overlays (F1-F12)
 ```
 
-#### Tier 1: Direct Keyboard Matrix Injection (`0x2000_B304`)
-- **Matrix Interface Specification:** Injects active-low column/row bitmasks into `g_kb_col_row_mask` (8 columns × 7 rows) at SRAM address `0x2000_B304`, directly driving the MC6821 PIA0 keyboard scanning interface.
+#### Tier 1: Direct Keyboard Matrix Injection (`0x2000_B304` / `0x2000_F200`)
+- **Matrix Interface Specification:** Injects active-low column/row bitmasks into `g_kb_col_row_mask` (8 columns × 7 rows) at SRAM address `0x2000_B304` (CoCo 2) or `0x2000_F200` (CoCo 3), dynamically discovered or auto-detected, directly driving the MC6821 PIA0 keyboard scanning interface.
 - **Chording Translation Contract (`kt_chord`):** Maps ASCII character sequences to native CoCo `dscan` matrix intersections, synthesizing automatic Shift chords for standard punctuation and symbols (`!`, `"`, `#`, `$`, `%`, `&`, `'`, `(`, `)`, `*`, `+`, `<`, `=`, `>`, `?`, `[`, `]`, `\`, `_`).
-- **Critical Timing Decision — Debounce Invariance:** Color BASIC's keyboard polling loop executes software debouncing that discards single-frame key pulses. Keystrokes are held asserted for 4 virtual frames (~66.7 ms at 60 Hz) and separated by a 2 virtual frame release gap (~33.3 ms). To guarantee reliable key latching under all emulation speeds, both durations are dynamically scaled by `--turbo` ($4 \times T$ and $2 \times T$), keeping virtual machine debouncing strictly invariant.
-- **Boot Readiness Tradeoff:** During the initial ~2.5 seconds of system boot, Color BASIC wipes and resets zero-page memory and input buffers. Keystroke dequeuing is gated until simulated cycle count reaches 630,000,000 cycles, preventing early keystrokes from being destroyed.
-- **Input Stream Multiplexing:** Accepts input concurrently from both the graphical SDL2 window (`TextInput` with `KeyDown` fallback) and a non-blocking background host terminal `stdin` thread.
+- **Critical Timing Decision — Debounce Invariance:** Color BASIC's keyboard polling loop executes software debouncing that discards single-frame key pulses. Keystrokes must be held asserted for at least one full 60 Hz vertical blank cycle (> 4,200,000 cycles) to ensure the 6809 PIA0 VBLANK keyboard scan interrupt reliably registers the key under all turbo rates, followed by a release gap ensuring clean debouncing before the next character. The hold duration is dynamically scaled by `--turbo` as $T + 1$ frames and the gap as $\max(1, \lfloor 2T/3 \rfloor)$ frames, keeping virtual machine debouncing strictly invariant without introducing sluggish queue serialization lag.
+- **Boot Readiness Specification:** During system boot, Color BASIC wipes and resets zero-page memory and input buffers. Keystroke dequeuing is gated until simulated cycle count reaches the machine's boot threshold (~150 frames / 630,000,000 cycles on CoCo 2; ~210 frames / 882,000,000 cycles on CoCo 3 to complete full 128 KB memory testing and GIME initialization), preventing early keystrokes from being destroyed.
+- **Input Stream Disambiguation & Key Repeat:** The graphical SDL2 window delegates all printable text (alphanumeric, symbols, space) strictly to `TextInput` events, eliminating double-keystroke race conditions between separate poll ticks. `KeyDown` events handle non-text editing, navigation, and control keys (`Return`, `Backspace`, `Escape`, `Tab`, `Home`/Clear, arrow keys, and function keys). Key repeat is supported for navigation and editing keys (`Backspace`, `Delete`, and cursor arrows), while concurrent input is accepted from non-blocking host terminal `stdin`.
 
 #### Tier 2: TinyUSB HID Callback Injection (`inject_hid_keycode`)
 The firmware's on-screen display (OSD) overlay system does not poll the keyboard matrix; it listens strictly for USB HID keyboard reports dispatched from TinyUSB host callbacks.
