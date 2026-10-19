@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::spi_sd::{SectorStorage, SD_SECTOR_SIZE};
+use crate::spi_sd::{SD_SECTOR_SIZE, SectorStorage};
 
 pub const SECTOR_SIZE: usize = 512;
 pub const SECTORS_PER_CLUSTER: usize = 8; // 4 KB clusters
@@ -151,9 +151,8 @@ impl VirtualFat32Storage {
                         format!("Failed to create directory {}: {e}", parent.display())
                     })?;
                 }
-                fs::write(&target_path, &file.data).map_err(|e| {
-                    format!("Failed to write {}: {e}", target_path.display())
-                })?;
+                fs::write(&target_path, &file.data)
+                    .map_err(|e| format!("Failed to write {}: {e}", target_path.display()))?;
             }
         }
 
@@ -330,8 +329,8 @@ pub fn build_image_from_tree(root_entries: Vec<VEntry>) -> Result<Vec<u8>, Strin
         cluster2_lba: usize,
     ) {
         let mut curr_dir_cluster = current_cluster;
-        let mut cluster_offset = (cluster2_lba + (curr_dir_cluster as usize - 2) * SECTORS_PER_CLUSTER)
-            * SECTOR_SIZE;
+        let mut cluster_offset =
+            (cluster2_lba + (curr_dir_cluster as usize - 2) * SECTORS_PER_CLUSTER) * SECTOR_SIZE;
         let mut dir_bytes = vec![0u8; CLUSTER_SIZE];
         let mut entry_idx = 0;
 
@@ -367,7 +366,8 @@ pub fn build_image_from_tree(root_entries: Vec<VEntry>) -> Result<Vec<u8>, Strin
                 *next_free_cluster += 1;
                 fat.insert(curr_dir_cluster, next_dir_cl);
                 curr_dir_cluster = next_dir_cl;
-                cluster_offset = (cluster2_lba + (curr_dir_cluster as usize - 2) * SECTORS_PER_CLUSTER)
+                cluster_offset = (cluster2_lba
+                    + (curr_dir_cluster as usize - 2) * SECTORS_PER_CLUSTER)
                     * SECTOR_SIZE;
                 dir_bytes.fill(0);
                 entry_idx = 0;
@@ -503,7 +503,9 @@ pub fn extract_fat32_files(disk: &[u8]) -> Result<Vec<ExtractedFile>, String> {
 
     let sectors_per_cluster = disk[bpb_off + 13] as usize;
     if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
-        return Err(format!("Invalid sectors per cluster: {sectors_per_cluster}"));
+        return Err(format!(
+            "Invalid sectors per cluster: {sectors_per_cluster}"
+        ));
     }
 
     let reserved_sectors = u16::from_le_bytes([disk[bpb_off + 14], disk[bpb_off + 15]]) as usize;
@@ -639,7 +641,9 @@ fn traverse_dir(
                 }
                 let ntres = chunk[12];
                 let mut base = String::from_utf8_lossy(&base_bytes).trim_end().to_string();
-                let mut ext = String::from_utf8_lossy(&chunk[8..11]).trim_end().to_string();
+                let mut ext = String::from_utf8_lossy(&chunk[8..11])
+                    .trim_end()
+                    .to_string();
                 if (ntres & 0x08) != 0 {
                     base = base.to_ascii_lowercase();
                 }

@@ -1,9 +1,9 @@
-use std::fs::File;
-use std::io::Write;
 use cocozero_rp2350::uf2::{
     FLASH_BASE, RP2350_ARM_S_FAMILY_ID, UF2_FLAG_FAMILY_ID_PRESENT, UF2_MAGIC_END,
     UF2_MAGIC_START_0, UF2_MAGIC_START_1,
 };
+use std::fs::File;
+use std::io::Write;
 
 fn main() {
     println!("Generating sample CoCo Zero RP2350 bare-metal UF2 firmware...");
@@ -132,7 +132,7 @@ fn main() {
     code.extend_from_slice(&0x0800_0000u32.to_le_bytes()); // 48: TMDS_CTRL
     code.extend_from_slice(&0x2001_0000u32.to_le_bytes()); // 52: FB base
     code.extend_from_slice(&0x07E0_07E0u32.to_le_bytes()); // 56: Green color
-    code.extend_from_slice(&38400u32.to_le_bytes());       // 60: pixel count / 2
+    code.extend_from_slice(&38400u32.to_le_bytes()); // 60: pixel count / 2
 
     // Pad to offset 64
     while code.len() < 64 {
@@ -162,6 +162,7 @@ fn main() {
     std::fs::create_dir_all("roms").unwrap();
     let out_path = "roms/demo.uf2";
     let mut file = File::create(out_path).expect("Failed to create demo.uf2");
-    file.write_all(&uf2_block).expect("Failed to write demo.uf2");
+    file.write_all(&uf2_block)
+        .expect("Failed to write demo.uf2");
     println!("Successfully generated demo UF2 firmware at: {}", out_path);
 }

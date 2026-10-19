@@ -69,25 +69,82 @@ pub fn kt_chord(c: char) -> Option<(u8, bool)> {
         '/' => K_SLASH,
         '@' => K_AT,
         '^' => K_UP,
-        '!' => { shift = true; K_1 },
-        '"' => { shift = true; K_2 },
-        '#' => { shift = true; 0x03 },
-        '$' => { shift = true; 0x04 },
-        '%' => { shift = true; 0x05 },
-        '&' => { shift = true; 0x06 },
-        '\'' => { shift = true; 0x07 },
-        '(' => { shift = true; 0x08 },
-        ')' => { shift = true; 0x09 },
-        '*' => { shift = true; K_COLON },
-        '+' => { shift = true; K_SEMI },
-        '<' => { shift = true; K_COMMA },
-        '=' => { shift = true; K_MINUS },
-        '>' => { shift = true; K_DOT },
-        '?' => { shift = true; K_SLASH },
-        '[' => { shift = true; K_DOWN },
-        ']' => { shift = true; K_RIGHT },
-        '\\' => { shift = true; K_CLEAR },
-        '_' => { shift = true; K_UP },
+        '!' => {
+            shift = true;
+            K_1
+        }
+        '"' => {
+            shift = true;
+            K_2
+        }
+        '#' => {
+            shift = true;
+            0x03
+        }
+        '$' => {
+            shift = true;
+            0x04
+        }
+        '%' => {
+            shift = true;
+            0x05
+        }
+        '&' => {
+            shift = true;
+            0x06
+        }
+        '\'' => {
+            shift = true;
+            0x07
+        }
+        '(' => {
+            shift = true;
+            0x08
+        }
+        ')' => {
+            shift = true;
+            0x09
+        }
+        '*' => {
+            shift = true;
+            K_COLON
+        }
+        '+' => {
+            shift = true;
+            K_SEMI
+        }
+        '<' => {
+            shift = true;
+            K_COMMA
+        }
+        '=' => {
+            shift = true;
+            K_MINUS
+        }
+        '>' => {
+            shift = true;
+            K_DOT
+        }
+        '?' => {
+            shift = true;
+            K_SLASH
+        }
+        '[' => {
+            shift = true;
+            K_DOWN
+        }
+        ']' => {
+            shift = true;
+            K_RIGHT
+        }
+        '\\' => {
+            shift = true;
+            K_CLEAR
+        }
+        '_' => {
+            shift = true;
+            K_UP
+        }
         '\x08' | '\x7F' => K_LEFT,
         '\x03' | '\x1B' => K_BREAK,
         '\x0C' => K_CLEAR,
@@ -193,7 +250,7 @@ impl KeyboardMatrix {
             self.hold_countdown -= 1;
             if self.hold_countdown == 0 {
                 self.typed_matrix = [0xFF; 8];
-                self.gap_countdown = 2 * t; // 2 virtual 60 Hz frames release gap
+                self.gap_countdown = (t * 2 / 3).max(1);
             }
         } else if self.gap_countdown > 0 {
             self.gap_countdown -= 1;
@@ -206,8 +263,11 @@ impl KeyboardMatrix {
                     let (s_row, s_col) = dscan_to_row_col(K_SHIFT);
                     self.typed_matrix[s_col as usize] &= !(1 << s_row);
                 }
-                self.hold_countdown = 4 * t; // 4 virtual 60 Hz frames hold duration (~66.7 ms)
-                eprintln!("[CoCo Keyboard] Injected key {:?} into matrix (held for {} virtual frames)", c, self.hold_countdown);
+                self.hold_countdown = t + 1;
+                eprintln!(
+                    "[CoCo Keyboard] Injected key {:?} into matrix (held for {} virtual frames)",
+                    c, self.hold_countdown
+                );
             } else {
                 eprintln!("[CoCo Keyboard] Warning: Unmapped character {:?}", c);
             }

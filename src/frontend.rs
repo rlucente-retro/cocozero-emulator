@@ -60,7 +60,11 @@ impl Frontend {
 
         let mut window = if !headless {
             video_subsystem
-                .window("CoCo Zero - Waveshare RP2350-PiZero Emulator", DISPLAY_WIDTH, DISPLAY_HEIGHT)
+                .window(
+                    "CoCo Zero - Waveshare RP2350-PiZero Emulator",
+                    DISPLAY_WIDTH,
+                    DISPLAY_HEIGHT,
+                )
                 .position_centered()
                 .build()
                 .map_err(|e| e.to_string())?
@@ -77,14 +81,15 @@ impl Frontend {
             video_subsystem.text_input().start();
         }
 
-        let canvas = window
-            .into_canvas()
-            .build()
-            .map_err(|e| e.to_string())?;
+        let canvas = window.into_canvas().build().map_err(|e| e.to_string())?;
 
         let texture_creator = canvas.texture_creator();
         let texture = texture_creator
-            .create_texture_streaming(PixelFormatEnum::RGB565, FRAME_WIDTH as u32, FRAME_HEIGHT as u32)
+            .create_texture_streaming(
+                PixelFormatEnum::RGB565,
+                FRAME_WIDTH as u32,
+                FRAME_HEIGHT as u32,
+            )
             .map_err(|e| e.to_string())?;
 
         let static_texture: Texture<'static> = unsafe { std::mem::transmute(texture) };
@@ -172,7 +177,9 @@ impl Frontend {
             .map_err(|e| e.to_string())?;
 
         self.canvas.clear();
-        self.canvas.copy(&self.texture, None, None).map_err(|e| e.to_string())?;
+        self.canvas
+            .copy(&self.texture, None, None)
+            .map_err(|e| e.to_string())?;
         self.canvas.present();
         Ok(())
     }
@@ -218,23 +225,36 @@ impl Frontend {
                     ..
                 } => {
                     let key = keycode.or_else(|| scancode.and_then(Keycode::from_scancode));
-                    if let Some(key) = key
-                        && !repeat
-                    {
-                        let shift = keymod.contains(sdl2::keyboard::Mod::LSHIFTMOD)
-                            || keymod.contains(sdl2::keyboard::Mod::RSHIFTMOD)
-                            || keymod.contains(sdl2::keyboard::Mod::CAPSMOD);
-                        let cmd_or_ctrl = keymod.contains(sdl2::keyboard::Mod::LGUIMOD)
-                            || keymod.contains(sdl2::keyboard::Mod::RGUIMOD)
-                            || keymod.contains(sdl2::keyboard::Mod::LCTRLMOD)
-                            || keymod.contains(sdl2::keyboard::Mod::RCTRLMOD);
-                        self.handle_key_down(key, shift, cmd_or_ctrl, is_menu_active, has_text_input);
+                    if let Some(key) = key {
+                        let is_repeatable = matches!(
+                            key,
+                            Keycode::Backspace
+                                | Keycode::Delete
+                                | Keycode::Up
+                                | Keycode::Down
+                                | Keycode::Left
+                                | Keycode::Right
+                        );
+                        if !repeat || is_repeatable {
+                            let shift = keymod.contains(sdl2::keyboard::Mod::LSHIFTMOD)
+                                || keymod.contains(sdl2::keyboard::Mod::RSHIFTMOD)
+                                || keymod.contains(sdl2::keyboard::Mod::CAPSMOD);
+                            let cmd_or_ctrl = keymod.contains(sdl2::keyboard::Mod::LGUIMOD)
+                                || keymod.contains(sdl2::keyboard::Mod::RGUIMOD)
+                                || keymod.contains(sdl2::keyboard::Mod::LCTRLMOD)
+                                || keymod.contains(sdl2::keyboard::Mod::RCTRLMOD);
+                            self.handle_key_down(
+                                key,
+                                shift,
+                                cmd_or_ctrl,
+                                is_menu_active,
+                                has_text_input,
+                            );
+                        }
                     }
                 }
                 Event::KeyUp {
-                    keycode,
-                    scancode,
-                    ..
+                    keycode, scancode, ..
                 } => {
                     let key = keycode.or_else(|| scancode.and_then(Keycode::from_scancode));
                     if let Some(key) = key {
@@ -270,10 +290,10 @@ impl Frontend {
     pub fn handle_key_down(
         &mut self,
         key: Keycode,
-        shift: bool,
+        _shift: bool,
         cmd_or_ctrl: bool,
         is_menu_active: bool,
-        has_text_input: bool,
+        _has_text_input: bool,
     ) {
         // 1. Function Keys and macOS Command/Control shortcuts
         if key == Keycode::F12 || (cmd_or_ctrl && key == Keycode::D) {
@@ -432,8 +452,7 @@ impl Frontend {
                 self.typed_chars.push_back('\x0C');
             }
             Keycode::Space => {
-                eprintln!("[Input] KeyDown: Space");
-                self.typed_chars.push_back(' ');
+                eprintln!("[Input] KeyDown: Space (game matrix)");
                 self.key_events.push(InputKeyEvent::Down(key));
             }
             Keycode::Up => {
@@ -460,13 +479,8 @@ impl Frontend {
                 self.key_events.push(InputKeyEvent::Down(key));
             }
             _ => {
-                // If TextInput is NOT handling this batch, fall back to keycode_to_char
-                if !has_text_input
-                    && let Some(ch) = keycode_to_char(key, shift)
-                {
-                    eprintln!("[Input] KeyDown (fallback): {:?}", ch);
-                    self.typed_chars.push_back(ch);
-                }
+                // Printable characters (A-Z, 0-9, space, symbols) are delivered cleanly
+                // by Event::TextInput, avoiding duplicate events and honoring host keyboard layouts.
             }
         }
     }
@@ -495,8 +509,8 @@ impl Frontend {
                 Button::DPadRight => self.hid_key_queue.push_back(0x4F), // HID KEY_RIGHT
                 Button::A => self.hid_key_queue.push_back(0x28), // HID KEY_ENTER (Select/Start)
                 Button::B | Button::Back => self.hid_key_queue.push_back(0x29), // HID KEY_ESCAPE (Close menu)
-                Button::LeftShoulder => self.hid_key_queue.push_back(0x4B), // HID KEY_PAGE_UP
-                Button::RightShoulder => self.hid_key_queue.push_back(0x4E), // HID KEY_PAGE_DOWN
+                Button::LeftShoulder => self.hid_key_queue.push_back(0x4B),     // HID KEY_PAGE_UP
+                Button::RightShoulder => self.hid_key_queue.push_back(0x4E),    // HID KEY_PAGE_DOWN
                 Button::X => self.hid_key_queue.push_back(0x2B), // HID KEY_TAB (Open editor on .TXT)
                 Button::Guide => self.hid_key_queue.push_back(0x29), // HID KEY_ESCAPE (Toggle menu closed)
                 _ => {}

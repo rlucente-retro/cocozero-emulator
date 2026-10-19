@@ -16,13 +16,26 @@ fn test_demo_uf2_execution() {
     for i in 0..10 {
         soc.step_cycles(1).unwrap();
         let c0 = soc.emu.core(0);
-        println!("step {}: PC={:#x}, r0={:#x}, r1={:#x}, r2={:#x}", i, c0.regs.pc(), c0.regs.r[0], c0.regs.r[1], c0.regs.r[2]);
+        println!(
+            "step {}: PC={:#x}, r0={:#x}, r1={:#x}, r2={:#x}",
+            i,
+            c0.regs.pc(),
+            c0.regs.r[0],
+            c0.regs.r[1],
+            c0.regs.r[2]
+        );
     }
 
     soc.step_cycles(10000).unwrap();
 
     let c0 = soc.emu.core(0);
-    println!("\nFinal PC={:#x}, r0={:#x}, r1={:#x}, r2={:#x}, TMDS CTRL={:#x}", 
-        c0.regs.pc(), c0.regs.r[0], c0.regs.r[1], c0.regs.r[2], soc.emu.bus.sio.tmds[0].ctrl);
+    println!(
+        "\nFinal PC={:#x}, r0={:#x}, r1={:#x}, r2={:#x}, TMDS CTRL={:#x}",
+        c0.regs.pc(),
+        c0.regs.r[0],
+        c0.regs.r[1],
+        c0.regs.r[2],
+        soc.emu.bus.sio.tmds[0].ctrl
+    );
     assert_eq!(soc.emu.bus.sio.tmds[0].ctrl, 0x0800_0000);
 }

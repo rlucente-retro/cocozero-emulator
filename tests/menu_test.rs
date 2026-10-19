@@ -31,12 +31,19 @@ fn test_menu_activation() {
 
     // Trigger Disks menu (F12, HID 0x45)
     soc.inject_hid_keycode(0x45);
-    assert!(soc.is_menu_active(), "Menu should be active after F12 injection");
+    assert!(
+        soc.is_menu_active(),
+        "Menu should be active after F12 injection"
+    );
     assert_eq!(soc.get_menu_mode(), 0, "Menu mode should be 0 (Disks)");
 
     // Verify that the disk directory scan populated disk images
     let disk_count = soc.emu.bus.read32(soc.symbols.menu_count_addr, 0);
-    assert!(disk_count >= 1, "SD directory scan should find at least 1 disk image (found {})", disk_count);
+    assert!(
+        disk_count >= 1,
+        "SD directory scan should find at least 1 disk image (found {})",
+        disk_count
+    );
 
     // Step 5 frames to let Core 0 render the menu
     for _ in 0..5 {
@@ -72,7 +79,10 @@ fn test_menu_activation() {
 
     // Test F1 Info overlay (HID 0x3A)
     soc.inject_hid_keycode(0x3A);
-    assert!(soc.is_menu_active(), "Menu should be active after F1 injection");
+    assert!(
+        soc.is_menu_active(),
+        "Menu should be active after F1 injection"
+    );
     assert_eq!(soc.get_menu_mode(), 4, "Menu mode should be 4 (Info)");
 
     // Close with Escape

@@ -22,14 +22,27 @@ pub const SD_SECTOR_SIZE: usize = 512;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum SdState {
-
     PowerOn,
     Idle,
     Ready,
-    ReadingSingleBlock { sector: u64, offset: usize },
-    ReadingMultiBlock { sector: u64, offset: usize },
-    WritingSingleBlock { sector: u64, offset: usize, buf: [u8; SD_SECTOR_SIZE] },
-    WritingMultiBlock { sector: u64, offset: usize, buf: [u8; SD_SECTOR_SIZE] },
+    ReadingSingleBlock {
+        sector: u64,
+        offset: usize,
+    },
+    ReadingMultiBlock {
+        sector: u64,
+        offset: usize,
+    },
+    WritingSingleBlock {
+        sector: u64,
+        offset: usize,
+        buf: [u8; SD_SECTOR_SIZE],
+    },
+    WritingMultiBlock {
+        sector: u64,
+        offset: usize,
+        buf: [u8; SD_SECTOR_SIZE],
+    },
 }
 
 /// Compute standard SD CRC16 (CRC-16-CCITT / IBM-3740: poly 0x1021, init 0x0000).
@@ -189,14 +202,21 @@ impl SpiSdCard {
 
     /// Return cumulative storage telemetry statistics (sectors read, sectors written, flushes performed).
     pub fn stats(&self) -> (u64, u64, u64) {
-        (self.sectors_read, self.sectors_written, self.flushes_performed)
+        (
+            self.sectors_read,
+            self.sectors_written,
+            self.flushes_performed,
+        )
     }
 
     pub fn set_cs(&mut self, asserted: bool) {
         self.cs_asserted = asserted;
         if !asserted {
             self.cmd_buf.clear();
-            if matches!(self.state, SdState::WritingSingleBlock { .. } | SdState::ReadingSingleBlock { .. }) {
+            if matches!(
+                self.state,
+                SdState::WritingSingleBlock { .. } | SdState::ReadingSingleBlock { .. }
+            ) {
                 self.state = SdState::Ready;
             }
         }
@@ -228,13 +248,19 @@ impl SpiSdCard {
             return 0xFF;
         }
 
-        let is_writing = matches!(self.state, SdState::WritingSingleBlock { .. } | SdState::WritingMultiBlock { .. });
+        let is_writing = matches!(
+            self.state,
+            SdState::WritingSingleBlock { .. } | SdState::WritingMultiBlock { .. }
+        );
 
         // Host sending a command (starts with 01xxxxxx, 0x40..=0x7F)
         if !is_writing && (!self.cmd_buf.is_empty() || (mosi & 0xC0) == 0x40) {
             if self.cmd_buf.is_empty() {
                 // If a new command begins, terminate any in-progress streaming read
-                if matches!(self.state, SdState::ReadingSingleBlock { .. } | SdState::ReadingMultiBlock { .. }) {
+                if matches!(
+                    self.state,
+                    SdState::ReadingSingleBlock { .. } | SdState::ReadingMultiBlock { .. }
+                ) {
                     self.state = SdState::Ready;
                 }
             }
@@ -259,7 +285,10 @@ impl SpiSdCard {
                 let ret = self.read_cached_stream_byte(offset);
                 let next_offset = offset + 1;
                 if next_offset < 1 + SD_SECTOR_SIZE + 2 {
-                    self.state = SdState::ReadingSingleBlock { sector, offset: next_offset };
+                    self.state = SdState::ReadingSingleBlock {
+                        sector,
+                        offset: next_offset,
+                    };
                 }
                 ret
             }
@@ -269,26 +298,48 @@ impl SpiSdCard {
                 if next_offset >= 1 + SD_SECTOR_SIZE + 2 {
                     let next_sec = sector + 1;
                     self.load_sector(next_sec);
-                    self.state = SdState::ReadingMultiBlock { sector: next_sec, offset: 0 };
+                    self.state = SdState::ReadingMultiBlock {
+                        sector: next_sec,
+                        offset: 0,
+                    };
                 } else {
-                    self.state = SdState::ReadingMultiBlock { sector, offset: next_offset };
+                    self.state = SdState::ReadingMultiBlock {
+                        sector,
+                        offset: next_offset,
+                    };
                 }
                 ret
             }
-            SdState::WritingSingleBlock { sector, mut offset, mut buf } => {
+            SdState::WritingSingleBlock {
+                sector,
+                mut offset,
+                mut buf,
+            } => {
                 if offset == 0 {
                     if mosi == 0xFE {
                         offset = 1;
                     }
-                    self.state = SdState::WritingSingleBlock { sector, offset, buf };
+                    self.state = SdState::WritingSingleBlock {
+                        sector,
+                        offset,
+                        buf,
+                    };
                 } else if offset <= SD_SECTOR_SIZE {
                     buf[offset - 1] = mosi;
                     offset += 1;
-                    self.state = SdState::WritingSingleBlock { sector, offset, buf };
+                    self.state = SdState::WritingSingleBlock {
+                        sector,
+                        offset,
+                        buf,
+                    };
                 } else if offset == SD_SECTOR_SIZE + 1 {
                     // First CRC byte
                     offset += 1;
-                    self.state = SdState::WritingSingleBlock { sector, offset, buf };
+                    self.state = SdState::WritingSingleBlock {
+                        sector,
+                        offset,
+                        buf,
+                    };
                 } else {
                     // Second CRC byte received; commit sector write to storage
                     self.sectors_written += 1;
@@ -298,28 +349,52 @@ impl SpiSdCard {
                 }
                 0xFF
             }
-            SdState::WritingMultiBlock { sector, mut offset, mut buf } => {
+            SdState::WritingMultiBlock {
+                sector,
+                mut offset,
+                mut buf,
+            } => {
                 if offset == 0 {
                     if mosi == 0xFC {
                         offset = 1;
-                        self.state = SdState::WritingMultiBlock { sector, offset, buf };
+                        self.state = SdState::WritingMultiBlock {
+                            sector,
+                            offset,
+                            buf,
+                        };
                     } else if mosi == 0xFD {
                         self.state = SdState::Ready;
                     } else {
-                        self.state = SdState::WritingMultiBlock { sector, offset, buf };
+                        self.state = SdState::WritingMultiBlock {
+                            sector,
+                            offset,
+                            buf,
+                        };
                     }
                 } else if offset <= SD_SECTOR_SIZE {
                     buf[offset - 1] = mosi;
                     offset += 1;
-                    self.state = SdState::WritingMultiBlock { sector, offset, buf };
+                    self.state = SdState::WritingMultiBlock {
+                        sector,
+                        offset,
+                        buf,
+                    };
                 } else if offset == SD_SECTOR_SIZE + 1 {
                     offset += 1;
-                    self.state = SdState::WritingMultiBlock { sector, offset, buf };
+                    self.state = SdState::WritingMultiBlock {
+                        sector,
+                        offset,
+                        buf,
+                    };
                 } else {
                     self.sectors_written += 1;
                     self.backing.write_sector(sector, &buf);
                     self.rx_queue.push_back(0x05); // Data accepted token
-                    self.state = SdState::WritingMultiBlock { sector: sector + 1, offset: 0, buf };
+                    self.state = SdState::WritingMultiBlock {
+                        sector: sector + 1,
+                        offset: 0,
+                        buf,
+                    };
                 }
                 0xFF
             }
@@ -369,7 +444,8 @@ impl SpiSdCard {
                 // CMD9: SEND_CSD
                 self.rx_queue.push_back(0x00); // R1 success
                 self.rx_queue.push_back(0xFE); // Data token
-                let c_size = ((self.backing.num_sectors() / 1024).saturating_sub(1) & 0x3F_FFFF) as u32;
+                let c_size =
+                    ((self.backing.num_sectors() / 1024).saturating_sub(1) & 0x3F_FFFF) as u32;
                 let mut csd = [0u8; 16];
                 csd[0] = 0x40; // CSD v2.0 (SDHC)
                 csd[1] = 0x0E;
@@ -463,12 +539,20 @@ impl SpiSdCard {
             55 => {
                 // CMD55: APP_CMD
                 self.app_cmd_next = true;
-                let r1 = if self.state == SdState::Idle { 0x01 } else { 0x00 };
+                let r1 = if self.state == SdState::Idle {
+                    0x01
+                } else {
+                    0x00
+                };
                 self.rx_queue.push_back(r1);
             }
             58 => {
                 // CMD58: READ_OCR
-                let r1 = if self.state == SdState::Idle { 0x01 } else { 0x00 };
+                let r1 = if self.state == SdState::Idle {
+                    0x01
+                } else {
+                    0x00
+                };
                 self.rx_queue.push_back(r1);
                 // OCR: Card power up status bit (31) = 1, CCS bit (30) = 1 (SDHC/SDXC), VDD = 3.2-3.4V
                 self.rx_queue.push_back(0xC0);

@@ -30,7 +30,10 @@ fn test_sio_fifo_multicore_communication() {
 
     // Core 1 reads from FIFO_RD
     let received = soc.emu.bus.read32(0xD000_0058, 1);
-    assert_eq!(received, test_word, "Core 1 should read exactly what Core 0 sent");
+    assert_eq!(
+        received, test_word,
+        "Core 1 should read exactly what Core 0 sent"
+    );
 
     // After read, Core 1 RX FIFO should be empty again
     let st1_empty = soc.emu.bus.read32(0xD000_0050, 1);
@@ -46,7 +49,10 @@ fn test_sio_fifo_multicore_communication() {
 
     // Core 0 reads from FIFO_RD
     let core0_recv = soc.emu.bus.read32(0xD000_0058, 0);
-    assert_eq!(core0_recv, reply_word, "Core 0 should read reply from Core 1");
+    assert_eq!(
+        core0_recv, reply_word,
+        "Core 0 should read reply from Core 1"
+    );
 }
 
 #[test]
@@ -63,8 +69,15 @@ fn test_bootrom_core1_wfe_park() {
 
         // Core 1 in Boot ROM enters WFE waiting loop
         let core1 = soc.emu.core(1);
-        println!("Core 1 state after Boot ROM boot: PC={:#x}, wfe={}", core1.regs.pc(), core1.is_wfe_waiting());
-        assert!(core1.is_wfe_waiting(), "Core 1 should be parked in WFE waiting loop in Boot ROM");
+        println!(
+            "Core 1 state after Boot ROM boot: PC={:#x}, wfe={}",
+            core1.regs.pc(),
+            core1.is_wfe_waiting()
+        );
+        assert!(
+            core1.is_wfe_waiting(),
+            "Core 1 should be parked in WFE waiting loop in Boot ROM"
+        );
     }
 }
 
@@ -121,12 +134,22 @@ fn test_dual_core_concurrent_fifo_exchange() {
     soc.emu.bus.atomics.clear_halted(1);
 
     // Run dual-core simulation for 1000 cycles
-    soc.step_cycles(1000).expect("Dual-core simulation should run cleanly");
+    soc.step_cycles(1000)
+        .expect("Dual-core simulation should run cleanly");
 
     // Both cores should have exchanged messages and computed 0x11223345!
     let r0_c0 = soc.emu.core(0).regs.r[0];
     let r0_c1 = soc.emu.core(1).regs.r[0];
-    println!("Dual-core FIFO exchange: Core 0 r0 = {:#x}, Core 1 r0 = {:#x}", r0_c0, r0_c1);
-    assert_eq!(r0_c1, 0x1122_3345, "Core 1 should receive and increment test message");
-    assert_eq!(r0_c0, 0x1122_3345, "Core 0 should receive incremented reply from Core 1");
+    println!(
+        "Dual-core FIFO exchange: Core 0 r0 = {:#x}, Core 1 r0 = {:#x}",
+        r0_c0, r0_c1
+    );
+    assert_eq!(
+        r0_c1, 0x1122_3345,
+        "Core 1 should receive and increment test message"
+    );
+    assert_eq!(
+        r0_c0, 0x1122_3345,
+        "Core 0 should receive incremented reply from Core 1"
+    );
 }

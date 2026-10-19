@@ -126,7 +126,11 @@ impl SioTmds {
             2 => ((self.ctrl >> 18) & 0x7) + 1,
             _ => 8,
         };
-        let mask = if nbits >= 32 { u32::MAX } else { (1u32 << nbits) - 1 };
+        let mask = if nbits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << nbits) - 1
+        };
         let rotated = wdata.rotate_right(rot);
         let raw = rotated & mask;
 

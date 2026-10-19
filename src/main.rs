@@ -1,14 +1,14 @@
+use clap::Parser;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use clap::Parser;
 
 use cocozero_rp2350::fat32::VirtualFat32Storage;
 use cocozero_rp2350::frontend::Frontend;
 
 use cocozero_rp2350::soc::{CoCoZeroSoC, FB_PIXELS};
 use cocozero_rp2350::spi_sd::{FileStorage, MemoryStorage, SectorStorage};
-use cocozero_rp2350::uf2::{parse_uf2, FlashImage};
+use cocozero_rp2350::uf2::{FlashImage, parse_uf2};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -42,7 +42,12 @@ struct Args {
     headless: bool,
 
     /// Maximum frames to run before exiting (0 = run indefinitely)
-    #[arg(short = 'f', long = "frames", alias = "max-frames", default_value_t = 0)]
+    #[arg(
+        short = 'f',
+        long = "frames",
+        alias = "max-frames",
+        default_value_t = 0
+    )]
     frames: u64,
 
     /// Simulation turbo factor (1 = 252 MHz, 2 = 2x speedup / 126 MHz virtual frame quantum, 4 = 4x speedup, etc.)
@@ -101,14 +106,22 @@ fn main() {
             Box::new(FileStorage::open(path).expect("Failed to open SD image file"))
         }
         Some(path) if path.is_dir() => {
-            println!("Mounting directory as virtual FAT32 SD card: {}", path.display());
-            Box::new(VirtualFat32Storage::from_directory(path).expect("Failed to build virtual FAT32"))
+            println!(
+                "Mounting directory as virtual FAT32 SD card: {}",
+                path.display()
+            );
+            Box::new(
+                VirtualFat32Storage::from_directory(path).expect("Failed to build virtual FAT32"),
+            )
         }
         _ => {
             let default_dir = Path::new("coco");
             if default_dir.is_dir() {
                 println!("Auto-mounting local ./coco directory as virtual FAT32 SD card...");
-                Box::new(VirtualFat32Storage::from_directory(default_dir).expect("Failed to build virtual FAT32"))
+                Box::new(
+                    VirtualFat32Storage::from_directory(default_dir)
+                        .expect("Failed to build virtual FAT32"),
+                )
             } else {
                 println!("No SD card specified; initializing empty 64 MB virtual card");
                 Box::new(MemoryStorage::new(64 * 1024 * 1024))
@@ -126,7 +139,10 @@ fn main() {
         let rom_data = std::fs::read(&args.bootrom).expect("Failed to read Boot ROM");
         soc.load_bootrom(&rom_data);
     } else {
-        println!("Notice: Boot ROM {} not found; using direct flash boot", args.bootrom.display());
+        println!(
+            "Notice: Boot ROM {} not found; using direct flash boot",
+            args.bootrom.display()
+        );
     }
 
     // 4. Load Firmware (UF2 or Raw Binary)
@@ -138,7 +154,15 @@ fn main() {
             "Flash image loaded: 0x{:08X} - 0x{:08X} (Entry PC: {:?}, Initial SP: {:?})",
             flash.min_addr, flash.max_addr, flash.entry_point, flash.initial_sp
         );
-        soc.load_firmware_with_elf(&flash, args.elf.as_deref());
+        let companion_elf = uf2_path.with_extension("elf");
+        let effective_elf = args.elf.as_deref().or_else(|| {
+            if companion_elf.is_file() {
+                Some(companion_elf.as_path())
+            } else {
+                None
+            }
+        });
+        soc.load_firmware_with_elf(&flash, effective_elf);
     } else if let Some(bin_path) = &args.bin {
         println!("Loading raw binary: {}", bin_path.display());
         let bin_data = std::fs::read(bin_path).expect("Failed to read binary file");
@@ -165,7 +189,10 @@ fn main() {
     if let Some(fb_str) = &args.fb_addr {
         let clean = fb_str.trim_start_matches("0x").trim_start_matches("0X");
         if let Ok(addr) = u32::from_str_radix(clean, 16) {
-            println!("Explicit CLI override: forcing framebuffer address to 0x{:08X}", addr);
+            println!(
+                "Explicit CLI override: forcing framebuffer address to 0x{:08X}",
+                addr
+            );
             soc.fb_addr = Some(addr);
         }
     }
@@ -257,13 +284,18 @@ fn main() {
 
         if !basic_ready_announced && soc.is_keyboard_ready() {
             basic_ready_announced = true;
-            println!("\n[System Ready] Color BASIC initialization complete! Ready for keyboard input.");
+            println!(
+                "\n[System Ready] Color BASIC initialization complete! Ready for keyboard input."
+            );
 
             // Inject scripted commands from file if specified
             if let Some(script_path) = &args.script {
                 match std::fs::read_to_string(script_path) {
                     Ok(content) => {
-                        println!("[Script] Injecting commands from {}:", script_path.display());
+                        println!(
+                            "[Script] Injecting commands from {}:",
+                            script_path.display()
+                        );
                         for line in content.lines() {
                             let trimmed = line.trim_end();
                             if !trimmed.is_empty() && !trimmed.starts_with('#') {
@@ -274,7 +306,11 @@ fn main() {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[Script] Failed to read script file {}: {}", script_path.display(), e);
+                        eprintln!(
+                            "[Script] Failed to read script file {}: {}",
+                            script_path.display(),
+                            e
+                        );
                     }
                 }
             }
@@ -301,11 +337,16 @@ fn main() {
         if let Some(target) = args.dump_frame
             && frame_count == target
         {
-            let out_path = args.dump_path.clone().unwrap_or_else(|| {
-                PathBuf::from(format!("frame_{}.bmp", target))
-            });
+            let out_path = args
+                .dump_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(format!("frame_{}.bmp", target)));
             match soc.dump_framebuffer_bmp(&out_path) {
-                Ok(()) => println!("\n[Screen Dump] Captured frame {} to {}", target, out_path.display()),
+                Ok(()) => println!(
+                    "\n[Screen Dump] Captured frame {} to {}",
+                    target,
+                    out_path.display()
+                ),
                 Err(e) => eprintln!("\n[Screen Dump] Failed to dump frame {}: {}", target, e),
             }
         }
@@ -332,7 +373,8 @@ fn main() {
         if last_fps_time.elapsed().as_secs() >= 1 {
             let elapsed = last_fps_time.elapsed().as_secs_f64();
             let fps = fps_counter as f64 / elapsed;
-            print!("\r[Emulating] Frame: {:>6} | Virt-FPS: {:>5.1} | Core 0 PC: 0x{:08X} | Core 1 PC: 0x{:08X}",
+            print!(
+                "\r[Emulating] Frame: {:>6} | Virt-FPS: {:>5.1} | Core 0 PC: 0x{:08X} | Core 1 PC: 0x{:08X}",
                 frame_count,
                 fps,
                 soc.emu.core(0).regs.pc(),
@@ -344,7 +386,10 @@ fn main() {
         }
 
         if args.frames > 0 && frame_count >= args.frames {
-            println!("\nReached maximum frames ({}); exiting cleanly.", args.frames);
+            println!(
+                "\nReached maximum frames ({}); exiting cleanly.",
+                args.frames
+            );
             break;
         }
 

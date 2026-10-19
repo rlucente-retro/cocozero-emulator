@@ -1,13 +1,15 @@
-use std::path::Path;
 use cocozero_rp2350::fat32::build_virtual_fat32;
 use cocozero_rp2350::soc::{CoCoZeroSoC, FB_PIXELS};
 use cocozero_rp2350::spi_sd::MemoryStorage;
 use cocozero_rp2350::uf2::parse_uf2;
+use std::path::Path;
 
 #[test]
 fn test_long_running_multicore_stability() {
     if !Path::new("coco/roms/bas12.rom").exists() {
-        eprintln!("Skipping test_long_running_multicore_stability: coco/roms/bas12.rom not present");
+        eprintln!(
+            "Skipping test_long_running_multicore_stability: coco/roms/bas12.rom not present"
+        );
         return;
     }
 
@@ -27,7 +29,8 @@ fn test_long_running_multicore_stability() {
 
     // Run 240 continuous frames (~4 seconds of real-time simulation)
     for frame in 0..240 {
-        soc.step_frame().expect("step_frame should succeed without error");
+        soc.step_frame()
+            .expect("step_frame should succeed without error");
 
         // Drain audio periodically every frame to simulate host audio callback
         let samples = soc.extract_audio();
@@ -51,9 +54,15 @@ fn test_long_running_multicore_stability() {
     let final_telem = soc.telemetry();
     assert_eq!(final_telem.frame, 240);
     assert!(final_telem.total_cycles >= 240 * (252_000_000 / 60));
-    assert!(total_samples_drained > 0, "Audio samples must be produced and drained");
+    assert!(
+        total_samples_drained > 0,
+        "Audio samples must be produced and drained"
+    );
     assert!(final_telem.cores.core0_cycles > 0);
-    assert!(soc.is_keyboard_ready(), "Color BASIC should be fully initialized after 240 frames");
+    assert!(
+        soc.is_keyboard_ready(),
+        "Color BASIC should be fully initialized after 240 frames"
+    );
 }
 
 #[test]
@@ -93,7 +102,11 @@ fn test_concurrent_multisubsystem_stress() {
 
         // Perform sector writes directly to storage to simulate concurrent disk activity
         let dummy_sector = [0x55u8; 512];
-        soc.sd_card.lock().unwrap().backing.write_sector(100 + step as u64, &dummy_sector);
+        soc.sd_card
+            .lock()
+            .unwrap()
+            .backing
+            .write_sector(100 + step as u64, &dummy_sector);
 
         // Advance simulation frame
         soc.step_frame().expect("step_frame");
@@ -140,7 +153,8 @@ fn test_dynamic_turbo_resilience() {
     let turbo_profile = [1, 2, 4, 6, 4, 2, 1];
     for &turbo in &turbo_profile {
         for _ in 0..10 {
-            soc.step_frame_turbo(turbo).expect("dynamic turbo step should succeed");
+            soc.step_frame_turbo(turbo)
+                .expect("dynamic turbo step should succeed");
             let _ = soc.extract_audio();
         }
     }

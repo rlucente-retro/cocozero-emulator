@@ -7,7 +7,9 @@ use std::path::Path;
 #[test]
 fn test_type_command_in_basic() {
     if !Path::new("coco/roms/bas12.rom").exists() {
-        eprintln!("Skipping test_type_command_in_basic: coco/roms/bas12.rom not present (user-supplied ROM required)");
+        eprintln!(
+            "Skipping test_type_command_in_basic: coco/roms/bas12.rom not present (user-supplied ROM required)"
+        );
         return;
     }
 
@@ -49,5 +51,8 @@ fn test_type_command_in_basic() {
         }
     }
     println!("Pixels changed after executing CLS: {}", diff_pixels);
-    assert!(diff_pixels > 500, "Executing CLS must clear the screen and change many pixels!");
+    assert!(
+        diff_pixels > 500,
+        "Executing CLS must clear the screen and change many pixels!"
+    );
 }

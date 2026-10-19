@@ -1,8 +1,8 @@
-use std::path::Path;
 use cocozero_rp2350::fat32::build_virtual_fat32;
-use cocozero_rp2350::soc::{save_bmp, CoCoZeroSoC, FB_HEIGHT, FB_PIXELS, FB_WIDTH};
+use cocozero_rp2350::soc::{CoCoZeroSoC, FB_HEIGHT, FB_PIXELS, FB_WIDTH, save_bmp};
 use cocozero_rp2350::spi_sd::MemoryStorage;
 use cocozero_rp2350::uf2::parse_uf2;
+use std::path::Path;
 
 #[test]
 fn test_soc_telemetry_gathering_and_display() {

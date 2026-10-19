@@ -102,7 +102,11 @@ impl CoCoZeroSoC {
     }
 
     /// Load Flash memory image with an optional companion ELF file for symbol extraction.
-    pub fn load_firmware_with_elf(&mut self, flash: &FlashImage, elf_path: Option<&std::path::Path>) {
+    pub fn load_firmware_with_elf(
+        &mut self,
+        flash: &FlashImage,
+        elf_path: Option<&std::path::Path>,
+    ) {
         self.emu.load_flash(&flash.memory);
 
         // Auto-detect firmware symbols from ELF or in-flash signatures
@@ -113,7 +117,10 @@ impl CoCoZeroSoC {
 
         // If bootrom is not loaded, initialize core 0 registers directly from flash vector table
         if let (Some(sp), Some(pc)) = (flash.initial_sp, flash.entry_point) {
-            println!("Initializing Core 0 vectors directly: SP=0x{:08X}, PC=0x{:08X}", sp, pc);
+            println!(
+                "Initializing Core 0 vectors directly: SP=0x{:08X}, PC=0x{:08X}",
+                sp, pc
+            );
             self.emu.core_mut(0).regs.msp = sp;
             self.emu.core_mut(0).regs.r[13] = sp;
             self.emu.core_mut(0).regs.set_pc(pc & !1);
@@ -194,7 +201,18 @@ impl CoCoZeroSoC {
 
     /// Check whether Color BASIC has completed boot and is ready for keyboard input.
     pub fn is_keyboard_ready(&self) -> bool {
-        self.keyboard_ready_forced || self.total_cycles >= 630_000_000
+        if self.keyboard_ready_forced {
+            return true;
+        }
+        // CoCo 3 (32 KB ROM at 0x2000_f200 matrix) requires ~210 6809 frames to complete memory test.
+        // CoCo 2 (16 KB ROM at 0x2000_b304 matrix) requires ~150 6809 frames.
+        let is_coco3 = self.symbols.kb_matrix_addr == 0x2000_f200;
+        let ready_cycles = if is_coco3 {
+            882_000_000u64 // 210 frames * 4,200,000 cycles
+        } else {
+            630_000_000u64 // 150 frames * 4,200,000 cycles
+        };
+        self.total_cycles >= ready_cycles / (self.turbo.max(1) as u64)
     }
 
     /// Step by one frame quantum (~252 MHz / 60 Hz = 4,200,000 cycles).
@@ -341,12 +359,19 @@ impl CoCoZeroSoC {
 
     /// Check whether a firmware menu overlay (Disks, Programs, Carts, Files, Info) is active.
     pub fn is_menu_active(&self) -> bool {
-        self.emu.bus.memory.sram_read8(self.symbols.menu_active_addr - 0x2000_0000) != 0
+        self.emu
+            .bus
+            .memory
+            .sram_read8(self.symbols.menu_active_addr - 0x2000_0000)
+            != 0
     }
 
     /// Get current active menu mode (0 = Disks, 1 = Programs, 2 = Carts, 3 = Files, 4 = Info).
     pub fn get_menu_mode(&self) -> u32 {
-        self.emu.bus.memory.sram_read32(self.symbols.menu_mode_addr - 0x2000_0000)
+        self.emu
+            .bus
+            .memory
+            .sram_read32(self.symbols.menu_mode_addr - 0x2000_0000)
     }
 
     /// Inject a USB HID keycode report into the firmware's TinyUSB host handler on Core 0.
@@ -358,7 +383,7 @@ impl CoCoZeroSoC {
         let report_addr = TRAMP_ADDR - 0x10;
 
         // 1. Send Key Press report [modifier, reserved, keycode, 0, 0, 0, 0, 0]
-        self.emu.bus.write8(report_addr, 0, 0);     // modifier
+        self.emu.bus.write8(report_addr, 0, 0); // modifier
         self.emu.bus.write8(report_addr + 1, 0, 0); // reserved
         self.emu.bus.write8(report_addr + 2, keycode, 0); // keycode[0]
         for i in 3..8 {
@@ -523,11 +548,20 @@ impl fmt::Display for SocTelemetry {
 }
 
 /// Save a 16-bit RGB565 framebuffer to a standard 24-bit uncompressed BMP file.
-pub fn save_bmp(path: impl AsRef<Path>, fb: &[u16], width: usize, height: usize) -> std::io::Result<()> {
+pub fn save_bmp(
+    path: impl AsRef<Path>,
+    fb: &[u16],
+    width: usize,
+    height: usize,
+) -> std::io::Result<()> {
     if fb.len() < width * height {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("Framebuffer buffer too small: expected {}, got {}", width * height, fb.len()),
+            format!(
+                "Framebuffer buffer too small: expected {}, got {}",
+                width * height,
+                fb.len()
+            ),
         ));
     }
     let row_padding = (4 - (width * 3) % 4) % 4;

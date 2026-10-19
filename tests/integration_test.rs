@@ -1,7 +1,10 @@
-use cocozero_rp2350::fat32::{build_image_from_tree, VEntry};
+use cocozero_rp2350::fat32::{VEntry, build_image_from_tree};
 use cocozero_rp2350::soc::CoCoZeroSoC;
 use cocozero_rp2350::spi_sd::MemoryStorage;
-use cocozero_rp2350::uf2::{parse_uf2, FLASH_BASE, RP2350_ARM_S_FAMILY_ID, UF2_FLAG_FAMILY_ID_PRESENT, UF2_MAGIC_END, UF2_MAGIC_START_0, UF2_MAGIC_START_1};
+use cocozero_rp2350::uf2::{
+    FLASH_BASE, RP2350_ARM_S_FAMILY_ID, UF2_FLAG_FAMILY_ID_PRESENT, UF2_MAGIC_END,
+    UF2_MAGIC_START_0, UF2_MAGIC_START_1, parse_uf2,
+};
 
 #[test]
 fn test_soc_initialization_and_firmware_execution() {
@@ -13,17 +16,13 @@ fn test_soc_initialization_and_firmware_execution() {
         },
         VEntry::Dir {
             name: "COCO".to_string(),
-            entries: vec![
-                VEntry::Dir {
-                    name: "ROMS".to_string(),
-                    entries: vec![
-                        VEntry::File {
-                            name: "BAS12.ROM".to_string(),
-                            data: vec![0x39; 8192], // 8192 bytes RTS opcode
-                        },
-                    ],
-                },
-            ],
+            entries: vec![VEntry::Dir {
+                name: "ROMS".to_string(),
+                entries: vec![VEntry::File {
+                    name: "BAS12.ROM".to_string(),
+                    data: vec![0x39; 8192], // 8192 bytes RTS opcode
+                }],
+            }],
         },
     ];
     let sd_bytes = build_image_from_tree(sd_tree).expect("Failed to build virtual FAT32 SD image");

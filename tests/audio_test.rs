@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use cocozero_rp2350::fat32::build_virtual_fat32;
-use cocozero_rp2350::soc::{CoCoZeroSoC, AUDIO_RING_SAMPLES};
+use cocozero_rp2350::soc::{AUDIO_RING_SAMPLES, CoCoZeroSoC};
 use cocozero_rp2350::spi_sd::MemoryStorage;
 use cocozero_rp2350::uf2::parse_uf2;
 
@@ -35,7 +35,11 @@ fn test_audio_ring_drain_and_telemetry() {
     }
 
     // Verify producer monotonic write index advanced in SRAM
-    let w = soc.emu.bus.memory.sram_read32(soc.symbols.audio_w_addr - 0x2000_0000);
+    let w = soc
+        .emu
+        .bus
+        .memory
+        .sram_read32(soc.symbols.audio_w_addr - 0x2000_0000);
     println!("After 60 frames: audio_w = {}", w);
     assert!(
         w > 0,
@@ -57,7 +61,13 @@ fn test_audio_ring_drain_and_telemetry() {
     );
     let min_sample = samples.iter().copied().min().unwrap_or(0);
     let max_sample = samples.iter().copied().max().unwrap_or(0);
-    println!("Drained {} samples: min={}, max={}, sample[0..10]={:?}", samples.len(), min_sample, max_sample, &samples[..10]);
+    println!(
+        "Drained {} samples: min={}, max={}, sample[0..10]={:?}",
+        samples.len(),
+        min_sample,
+        max_sample,
+        &samples[..10]
+    );
 
     // Because 60 frames produced > 8,192 samples (AUDIO_RING_SAMPLES), the producer
     // lapped the reader during the 60-frame run without draining.
@@ -70,24 +80,38 @@ fn test_audio_ring_drain_and_telemetry() {
     assert_eq!(soc.host_audio_r, w, "host_audio_r must advance to w");
 
     // Verify SRAM telemetry g_audio_r is synchronized with w
-    let r_sram = soc.emu.bus.memory.sram_read32(soc.symbols.audio_r_addr - 0x2000_0000);
+    let r_sram = soc
+        .emu
+        .bus
+        .memory
+        .sram_read32(soc.symbols.audio_r_addr - 0x2000_0000);
     assert_eq!(r_sram, w, "Firmware SRAM g_audio_r must match w");
 
     // Verify stereo interleaving: L == R for all pairs
     for chunk in samples.chunks_exact(2) {
-        assert_eq!(chunk[0], chunk[1], "Mono sample must be duplicated identically into left and right stereo channels");
+        assert_eq!(
+            chunk[0], chunk[1],
+            "Mono sample must be duplicated identically into left and right stereo channels"
+        );
     }
 
     // Calling extract_audio immediately without stepping frames must yield empty Vec
     let empty_samples = soc.extract_audio();
-    assert!(empty_samples.is_empty(), "Immediate re-extraction without stepping must be empty");
+    assert!(
+        empty_samples.is_empty(),
+        "Immediate re-extraction without stepping must be empty"
+    );
 
     // Step 5 more frames (5 frames * ~800 samples = ~4,000 samples, well within 8,192 capacity)
     for _ in 0..5 {
         soc.step_frame().expect("Should step frame");
     }
 
-    let w2 = soc.emu.bus.memory.sram_read32(soc.symbols.audio_w_addr - 0x2000_0000);
+    let w2 = soc
+        .emu
+        .bus
+        .memory
+        .sram_read32(soc.symbols.audio_w_addr - 0x2000_0000);
     assert!(w2 > w, "audio_w must advance after 5 more frames");
     let produced = w2 - w;
     println!("Produced {} samples in 5 frames", produced);
@@ -100,7 +124,11 @@ fn test_audio_ring_drain_and_telemetry() {
     );
     assert_eq!(soc.host_audio_r, w2);
 
-    let r_sram2 = soc.emu.bus.memory.sram_read32(soc.symbols.audio_r_addr - 0x2000_0000);
+    let r_sram2 = soc
+        .emu
+        .bus
+        .memory
+        .sram_read32(soc.symbols.audio_r_addr - 0x2000_0000);
     assert_eq!(r_sram2, w2);
 }
 
@@ -111,7 +139,10 @@ fn test_audio_ring_overflow_handling() {
 
     // Manually set write pointer beyond ring capacity
     let fake_w = 20_000u32;
-    soc.emu.bus.memory.sram_write32(soc.symbols.audio_w_addr - 0x2000_0000, fake_w);
+    soc.emu
+        .bus
+        .memory
+        .sram_write32(soc.symbols.audio_w_addr - 0x2000_0000, fake_w);
 
     assert_eq!(soc.host_audio_r, 0);
     let samples = soc.extract_audio();
@@ -120,6 +151,10 @@ fn test_audio_ring_overflow_handling() {
     assert_eq!(samples.len(), AUDIO_RING_SAMPLES * 2);
     assert_eq!(soc.host_audio_r, fake_w);
 
-    let r_sram = soc.emu.bus.memory.sram_read32(soc.symbols.audio_r_addr - 0x2000_0000);
+    let r_sram = soc
+        .emu
+        .bus
+        .memory
+        .sram_read32(soc.symbols.audio_r_addr - 0x2000_0000);
     assert_eq!(r_sram, fake_w);
 }

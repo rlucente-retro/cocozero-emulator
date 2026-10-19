@@ -1,8 +1,8 @@
 use cocozero_rp2350::soc::CoCoZeroSoC;
 use cocozero_rp2350::spi_sd::MemoryStorage;
 use cocozero_rp2350::uf2::{
-    parse_uf2, FLASH_BASE, RP2350_ARM_S_FAMILY_ID, UF2_FLAG_FAMILY_ID_PRESENT, UF2_MAGIC_END,
-    UF2_MAGIC_START_0, UF2_MAGIC_START_1,
+    FLASH_BASE, RP2350_ARM_S_FAMILY_ID, UF2_FLAG_FAMILY_ID_PRESENT, UF2_MAGIC_END,
+    UF2_MAGIC_START_0, UF2_MAGIC_START_1, parse_uf2,
 };
 
 #[test]

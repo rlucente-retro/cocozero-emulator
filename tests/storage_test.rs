@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cocozero_rp2350::fat32::{
-    VirtualFat32Storage, PARTITION_START_LBA, SECTOR_SIZE, TOTAL_SECTORS,
+    PARTITION_START_LBA, SECTOR_SIZE, TOTAL_SECTORS, VirtualFat32Storage,
 };
 use cocozero_rp2350::soc::CoCoZeroSoC;
-use cocozero_rp2350::spi_sd::{SectorStorage, SD_SECTOR_SIZE};
+use cocozero_rp2350::spi_sd::{SD_SECTOR_SIZE, SectorStorage};
 
 /// Helper to create a unique temporary directory for testing.
 struct TestTempDir {

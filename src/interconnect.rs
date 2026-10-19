@@ -4,10 +4,10 @@
 //! - Captures UART0 serial telemetry (0x40070000)
 //! - Monitors MicroSD software CS on GPIO 43
 
-use std::sync::Arc;
 use rp2350_emu::bus::Bus;
 use rp2350_emu::core::CoreBus;
 use rp2350_emu::threaded::CoreAtomics;
+use std::sync::Arc;
 
 use crate::sio_tmds::SioTmds;
 use crate::spi_sd::SpiSdCard;

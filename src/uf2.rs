@@ -87,7 +87,10 @@ impl FlashImage {
 /// Parse a UF2 file and populate a FlashImage.
 pub fn parse_uf2(data: &[u8]) -> Result<FlashImage, String> {
     if !data.len().is_multiple_of(512) {
-        return Err(format!("UF2 file size ({}) must be a multiple of 512 bytes", data.len()));
+        return Err(format!(
+            "UF2 file size ({}) must be a multiple of 512 bytes",
+            data.len()
+        ));
     }
 
     let mut flash = FlashImage::new(DEFAULT_FLASH_SIZE);
@@ -100,7 +103,8 @@ pub fn parse_uf2(data: &[u8]) -> Result<FlashImage, String> {
         let magic1 = u32::from_le_bytes(block_slice[4..8].try_into().unwrap());
         let magic_end = u32::from_le_bytes(block_slice[508..512].try_into().unwrap());
 
-        if magic0 != UF2_MAGIC_START_0 || magic1 != UF2_MAGIC_START_1 || magic_end != UF2_MAGIC_END {
+        if magic0 != UF2_MAGIC_START_0 || magic1 != UF2_MAGIC_START_1 || magic_end != UF2_MAGIC_END
+        {
             return Err(format!("Invalid UF2 magic at block {}", i));
         }
 
@@ -125,7 +129,10 @@ pub fn parse_uf2(data: &[u8]) -> Result<FlashImage, String> {
         }
 
         if payload_size > 476 {
-            return Err(format!("Payload size {} exceeds 476 bytes at block {}", payload_size, i));
+            return Err(format!(
+                "Payload size {} exceeds 476 bytes at block {}",
+                payload_size, i
+            ));
         }
 
         // Map target address to flash offset
