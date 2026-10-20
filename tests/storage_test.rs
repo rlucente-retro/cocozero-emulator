@@ -257,3 +257,99 @@ fn test_soc_flush_storage_integration() {
     let updated = fs::read(temp.path().join("settings.txt")).unwrap();
     assert_eq!(updated, b"turbo=2\n");
 }
+
+#[test]
+fn test_soc_spindle_motor_off_sync() {
+    let temp = TestTempDir::new("cocozero_motor_sync");
+    let roms_dir = temp.path().join("roms");
+    fs::create_dir_all(&roms_dir).unwrap();
+    fs::write(roms_dir.join("bas12.rom"), vec![0x12; 8192]).unwrap();
+    fs::write(temp.path().join("settings.txt"), b"turbo=1\n").unwrap();
+
+    let storage = VirtualFat32Storage::from_directory(temp.path()).expect("Should build storage");
+    let mut soc = CoCoZeroSoC::new(Box::new(storage)).expect("Should create SoC");
+
+    let latch_addr = soc.symbols.fdc_latch_addr.expect("fdc_latch_addr present");
+    let drive_addr = soc.symbols.fdc_drive_addr.expect("fdc_drive_addr present");
+
+    // Initially motor is off
+    assert!(!soc.is_spindle_motor_on(), "Spindle motor initially off");
+    assert_eq!(soc.get_fdc_latch(), Some(0));
+
+    // 1. Emulate Disk BASIC starting disk write:
+    // Drive 1 selected (bit 1 = 1), Motor On (bit 3 = 1) -> latch = 0x0A
+    soc.emu
+        .bus
+        .memory
+        .sram_write8(latch_addr - 0x2000_0000, 0x0A);
+    soc.emu.bus.memory.sram_write32(drive_addr - 0x2000_0000, 1);
+
+    assert!(soc.is_spindle_motor_on(), "Spindle motor energized");
+    assert_eq!(soc.get_fdc_drive(), Some(1), "Drive 1 selected");
+
+    // Call check_fdc_motor_sync while motor is running - should NOT flush
+    assert!(
+        !soc.check_fdc_motor_sync(),
+        "No flush while motor remains running"
+    );
+    assert!(soc.prev_fdc_motor_on, "prev_fdc_motor_on updated to true");
+
+    // 2. Perform sector write while motor is on (simulating sector write during active transfer)
+    let needle = b"turbo=1\n";
+    {
+        let mut sd = soc.sd_card.lock().unwrap();
+        let mut buf = [0u8; SD_SECTOR_SIZE];
+        let mut target_sec = 0u64;
+        for s in 4128..4200 {
+            if sd.backing.read_sector(s, &mut buf)
+                && let Some(pos) = buf.windows(needle.len()).position(|w| w == needle)
+            {
+                buf[pos..pos + needle.len()].copy_from_slice(b"turbo=3\n");
+                sd.backing.write_sector(s, &buf);
+                target_sec = s;
+                break;
+            }
+        }
+        assert!(target_sec > 0, "Must have found and modified sector");
+    }
+
+    // Host file is NOT yet updated (still cached in VirtualFat32Storage)
+    let content_before = fs::read(temp.path().join("settings.txt")).unwrap();
+    assert_eq!(
+        content_before, b"turbo=1\n",
+        "Host file unchanged during active transfer"
+    );
+
+    // 3. Emulate Disk BASIC completing transfer and turning motor off:
+    // Latch bit 3 goes from 1 to 0 (1 -> 0 transition) -> latch = 0x02
+    soc.emu
+        .bus
+        .memory
+        .sram_write8(latch_addr - 0x2000_0000, 0x02);
+    assert!(!soc.is_spindle_motor_on(), "Spindle motor stopped");
+
+    // 4. Trigger motor sync (as happens on next frame step)
+    let flushed = soc.check_fdc_motor_sync();
+    assert!(
+        flushed,
+        "1 -> 0 transition triggers immediate storage flush"
+    );
+    assert_eq!(
+        soc.motor_off_syncs, 1,
+        "Telemetry records motor-off sync event"
+    );
+
+    // Verify host file was immediately persisted!
+    let content_after = fs::read(temp.path().join("settings.txt")).unwrap();
+    assert_eq!(
+        content_after, b"turbo=3\n",
+        "Host file updated immediately on motor off"
+    );
+
+    // 5. Subsequent check when motor remains off does NOT re-flush
+    assert!(
+        !soc.check_fdc_motor_sync(),
+        "No repeat flush when motor stays off"
+    );
+    assert_eq!(soc.motor_off_syncs, 1);
+}

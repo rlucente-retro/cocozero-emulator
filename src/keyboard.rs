@@ -174,6 +174,10 @@ pub fn keycode_to_dscan(key: Keycode) -> Option<u8> {
 pub struct KeyboardMatrix {
     /// Physical SRAM address of `g_kb_col_row_mask`.
     pub matrix_addr: u32,
+    /// Physical SRAM address of `g_kb_src` (3 sources x 8 columns, PIZERO-163).
+    pub src_addr: Option<u32>,
+    /// Physical SRAM address of `g_kb_src_ready`.
+    pub src_ready_addr: Option<u32>,
     /// Active-low matrix for physical key hold/release (0 = pressed, 1 = unpressed).
     physical_matrix: [u8; 8],
     /// Active-low matrix for currently typing character.
@@ -197,6 +201,8 @@ impl KeyboardMatrix {
     pub fn new() -> Self {
         Self {
             matrix_addr: KB_MATRIX_ADDR,
+            src_addr: None,
+            src_ready_addr: None,
             physical_matrix: [0xFF; 8],
             typed_matrix: [0xFF; 8],
             type_queue: VecDeque::new(),
@@ -273,10 +279,40 @@ impl KeyboardMatrix {
             }
         }
 
-        // Combine physical layer and typed character layer (bitwise AND: active low)
-        for c in 0..8 {
-            let col_mask = self.physical_matrix[c] & self.typed_matrix[c];
-            bus.write8(self.matrix_addr + c as u32, col_mask, 0);
+        // Multi-Source Keyboard Layering (PIZERO-163):
+        // If g_kb_src is available, maintain layer 0 (COCO_KEYS_USB) and combine with
+        // layer 1 (COCO_KEYS_TYPED) and layer 2 (COCO_KEYS_PAD).
+        if let Some(src_addr) = self.src_addr {
+            if let Some(ready_addr) = self.src_ready_addr {
+                let ready = bus.read8(ready_addr, 0);
+                if ready == 0 {
+                    // Initialize all 24 bytes of g_kb_src to 0xFF (released)
+                    for i in 0..24 {
+                        bus.write8(src_addr + i, 0xFF, 0);
+                    }
+                    bus.write8(ready_addr, 1, 0);
+                }
+            }
+
+            for c in 0..8 {
+                let col_mask = self.physical_matrix[c] & self.typed_matrix[c];
+                // Layer 0: COCO_KEYS_USB (bytes 0..7)
+                bus.write8(src_addr + c as u32, col_mask, 0);
+
+                // Layer 1: COCO_KEYS_TYPED (bytes 8..15)
+                let s1 = bus.read8(src_addr + 8 + c as u32, 0);
+                // Layer 2: COCO_KEYS_PAD (bytes 16..23)
+                let s2 = bus.read8(src_addr + 16 + c as u32, 0);
+
+                let combined = col_mask & s1 & s2;
+                bus.write8(self.matrix_addr + c as u32, combined, 0);
+            }
+        } else {
+            // Fallback: direct write to matrix_addr
+            for c in 0..8 {
+                let col_mask = self.physical_matrix[c] & self.typed_matrix[c];
+                bus.write8(self.matrix_addr + c as u32, col_mask, 0);
+            }
         }
     }
 }

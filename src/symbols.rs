@@ -13,6 +13,10 @@ use std::path::Path;
 pub struct FirmwareSymbols {
     pub fb_addr: u32,
     pub kb_matrix_addr: u32,
+    pub kb_src_addr: Option<u32>,
+    pub kb_src_ready_addr: Option<u32>,
+    pub joy_axis_addr: Option<u32>,
+    pub joy_fire_addr: Option<u32>,
     pub menu_active_addr: u32,
     pub menu_mode_addr: u32,
     pub menu_count_addr: u32,
@@ -20,6 +24,11 @@ pub struct FirmwareSymbols {
     pub audio_ring_addr: u32,
     pub audio_w_addr: u32,
     pub audio_r_addr: u32,
+    pub c3bus_addr: Option<u32>,
+    pub gime3_ptr_addr: Option<u32>,
+    pub g_m_addr: Option<u32>,
+    pub fdc_latch_addr: Option<u32>,
+    pub fdc_drive_addr: Option<u32>,
 }
 
 impl Default for FirmwareSymbols {
@@ -27,6 +36,10 @@ impl Default for FirmwareSymbols {
         Self {
             fb_addr: 0x2002_2780,
             kb_matrix_addr: 0x2000_b304,
+            kb_src_addr: Some(0x2004_b81c),
+            kb_src_ready_addr: Some(0x2006_0450),
+            joy_axis_addr: Some(0x2000_b2f4),
+            joy_fire_addr: Some(0x2006_0443),
             menu_active_addr: 0x2000_c8e8,
             menu_mode_addr: 0x2000_c8ec,
             menu_count_addr: 0x2000_c8fc,
@@ -34,6 +47,11 @@ impl Default for FirmwareSymbols {
             audio_ring_addr: 0x2001_80c4,
             audio_w_addr: 0x2004_b8a0,
             audio_r_addr: 0x2004_b89c,
+            c3bus_addr: None,
+            gime3_ptr_addr: None,
+            g_m_addr: Some(0x2001_c2cc),
+            fdc_latch_addr: Some(0x2001_c2f9),
+            fdc_drive_addr: Some(0x2001_c404),
         }
     }
 }
@@ -132,6 +150,27 @@ impl FirmwareSymbols {
         {
             res.kb_matrix_addr = addr;
         }
+        if let Some(&addr) = syms.get("_ZL8g_kb_src").or_else(|| syms.get("g_kb_src")) {
+            res.kb_src_addr = Some(addr);
+        }
+        if let Some(&addr) = syms
+            .get("_ZL14g_kb_src_ready")
+            .or_else(|| syms.get("g_kb_src_ready"))
+        {
+            res.kb_src_ready_addr = Some(addr);
+        }
+        if let Some(&addr) = syms
+            .get("_ZL10g_joy_axis")
+            .or_else(|| syms.get("g_joy_axis"))
+        {
+            res.joy_axis_addr = Some(addr);
+        }
+        if let Some(&addr) = syms
+            .get("_ZL10g_joy_fire")
+            .or_else(|| syms.get("g_joy_fire"))
+        {
+            res.joy_fire_addr = Some(addr);
+        }
         if let Some(&addr) = syms.get("_ZL5g_ovk").or_else(|| syms.get("g_ovk")) {
             res.menu_active_addr = addr;
             res.menu_mode_addr = addr + 4;
@@ -151,6 +190,17 @@ impl FirmwareSymbols {
         }
         if let Some(&addr) = syms.get("_ZL9g_audio_r").or_else(|| syms.get("g_audio_r")) {
             res.audio_r_addr = addr;
+        }
+        if let Some(&addr) = syms.get("_ZL7g_c3bus").or_else(|| syms.get("g_c3bus")) {
+            res.c3bus_addr = Some(addr);
+        }
+        if let Some(&addr) = syms.get("_ZL7g_gime3").or_else(|| syms.get("g_gime3")) {
+            res.gime3_ptr_addr = Some(addr);
+        }
+        if let Some(&addr) = syms.get("_ZL3g_m").or_else(|| syms.get("g_m")) {
+            res.g_m_addr = Some(addr);
+            res.fdc_latch_addr = Some(addr + 0x2D);
+            res.fdc_drive_addr = Some(addr + 0x138);
         }
 
         Ok(res)
@@ -187,7 +237,37 @@ impl FirmwareSymbols {
                 let candidate = u32::from_le_bytes(flash_bytes[i - 4..i].try_into().unwrap());
                 if (0x2000_0000..=0x2008_0000).contains(&candidate) {
                     res.kb_matrix_addr = candidate;
+                    res.joy_axis_addr = Some(candidate - 0x10);
+                    if i >= 8 {
+                        let src_cand =
+                            u32::from_le_bytes(flash_bytes[i - 8..i - 4].try_into().unwrap());
+                        if (0x2000_0000..=0x2008_0000).contains(&src_cand) {
+                            res.kb_src_addr = Some(src_cand);
+                        }
+                    }
+                    if i >= 12 {
+                        let ready_cand =
+                            u32::from_le_bytes(flash_bytes[i - 12..i - 8].try_into().unwrap());
+                        if (0x2000_0000..=0x2008_0000).contains(&ready_cand) {
+                            res.kb_src_ready_addr = Some(ready_cand);
+                        }
+                    }
                     break;
+                }
+            }
+        }
+
+        // 2b. Scan for joy_fire_addr literal following joy_axis_addr in literal pool
+        if let Some(axis_addr) = res.joy_axis_addr {
+            let axis_bytes = axis_addr.to_le_bytes();
+            for (i, window) in flash_bytes.windows(4).enumerate().step_by(4) {
+                if window == axis_bytes && i + 8 <= flash_bytes.len() {
+                    let next_word =
+                        u32::from_le_bytes(flash_bytes[i + 4..i + 8].try_into().unwrap());
+                    if (0x2000_0000..=0x2008_2000).contains(&next_word) {
+                        res.joy_fire_addr = Some(next_word);
+                        break;
+                    }
                 }
             }
         }
@@ -243,6 +323,35 @@ impl FirmwareSymbols {
                     res.audio_r_addr = w1;
                     res.audio_ring_addr = w3;
                 }
+            }
+        }
+
+        // 6. Scan for g_m: opcode pattern of coco_machine_fdc_drive():
+        //    ldr r3, [pc, #4]; ldr.w r0, [r3, #0x138]; bx lr;
+        //    Bytes: [0x01, 0x4B, 0xD3, 0xF8, 0x38, 0x01, 0x70, 0x47]
+        let pat_fdc_drive = [0x01, 0x4B, 0xD3, 0xF8, 0x38, 0x01, 0x70, 0x47];
+        if let Some(pos) = flash_bytes
+            .windows(pat_fdc_drive.len())
+            .position(|w| w == pat_fdc_drive)
+        {
+            let lit_off = (pos + 8) & !3;
+            if lit_off + 4 <= flash_bytes.len() {
+                let g_m = u32::from_le_bytes(flash_bytes[lit_off..lit_off + 4].try_into().unwrap());
+                if (0x2000_0000..=0x2008_0000).contains(&g_m) {
+                    res.g_m_addr = Some(g_m);
+                    res.fdc_latch_addr = Some(g_m + 0x2D);
+                    res.fdc_drive_addr = Some(g_m + 0x138);
+                }
+            }
+        }
+
+        if res.kb_matrix_addr == 0x2000_f200 {
+            res.c3bus_addr = Some(0x2001_0860);
+            res.gime3_ptr_addr = Some(0x2004_bbf0);
+            if res.g_m_addr.is_none() {
+                res.g_m_addr = Some(0x2002_3b3c);
+                res.fdc_latch_addr = Some(0x2002_3b69);
+                res.fdc_drive_addr = Some(0x2002_3c74);
             }
         }
 
@@ -347,6 +456,8 @@ mod tests {
         let syms = FirmwareSymbols::from_elf(&bytes).expect("Failed to parse ELF symbols");
         assert_eq!(syms.fb_addr, 0x2002_2780);
         assert_eq!(syms.kb_matrix_addr, 0x2000_b304);
+        assert_eq!(syms.kb_src_addr, Some(0x2004_b81c));
+        assert_eq!(syms.kb_src_ready_addr, Some(0x2006_0450));
         assert_eq!(syms.menu_active_addr, 0x2000_c8e8);
         assert_eq!(syms.menu_mode_addr, 0x2000_c8ec);
         assert_eq!(syms.menu_count_addr, 0x2000_c8fc);
@@ -354,6 +465,22 @@ mod tests {
         assert_eq!(syms.audio_ring_addr, 0x2001_80c4);
         assert_eq!(syms.audio_w_addr, 0x2004_b8a0);
         assert_eq!(syms.audio_r_addr, 0x2004_b89c);
+        assert_eq!(syms.g_m_addr, Some(0x2001_c2cc));
+        assert_eq!(syms.fdc_latch_addr, Some(0x2001_c2f9));
+        assert_eq!(syms.fdc_drive_addr, Some(0x2001_c404));
+
+        let c3_elf = Path::new("roms/cocozero-coco3.elf");
+        if c3_elf.exists() {
+            let c3_bytes = std::fs::read(c3_elf).expect("Read cocozero-coco3.elf");
+            let c3_syms =
+                FirmwareSymbols::from_elf(&c3_bytes).expect("Parse cocozero-coco3.elf symbols");
+            assert_eq!(c3_syms.c3bus_addr, Some(0x2001_0860));
+            assert_eq!(c3_syms.gime3_ptr_addr, Some(0x2004_bbf0));
+            assert_eq!(c3_syms.kb_matrix_addr, 0x2000_f200);
+            assert_eq!(c3_syms.g_m_addr, Some(0x2002_3b3c));
+            assert_eq!(c3_syms.fdc_latch_addr, Some(0x2002_3b69));
+            assert_eq!(c3_syms.fdc_drive_addr, Some(0x2002_3c74));
+        }
     }
 
     #[test]
@@ -369,6 +496,8 @@ mod tests {
         let syms = FirmwareSymbols::from_flash_signatures(&flash.memory, crate::uf2::FLASH_BASE);
 
         assert_eq!(syms.kb_matrix_addr, 0x2000_b304);
+        assert_eq!(syms.kb_src_addr, Some(0x2004_b81c));
+        assert_eq!(syms.kb_src_ready_addr, Some(0x2006_0450));
         assert_eq!(syms.menu_active_addr, 0x2000_c8e8);
         assert_eq!(syms.menu_mode_addr, 0x2000_c8ec);
         assert_eq!(syms.menu_count_addr, 0x2000_c8fc);
@@ -377,5 +506,8 @@ mod tests {
         assert_eq!(syms.audio_ring_addr, 0x2001_80c4);
         assert_eq!(syms.audio_w_addr, 0x2004_b8a0);
         assert_eq!(syms.audio_r_addr, 0x2004_b89c);
+        assert_eq!(syms.g_m_addr, Some(0x2001_c2cc));
+        assert_eq!(syms.fdc_latch_addr, Some(0x2001_c2f9));
+        assert_eq!(syms.fdc_drive_addr, Some(0x2001_c404));
     }
 }

@@ -1,4 +1,5 @@
 pub mod fat32;
+pub mod font_gime;
 pub mod frontend;
 pub mod interconnect;
 pub mod keyboard;

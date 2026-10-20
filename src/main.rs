@@ -6,7 +6,7 @@ use std::time::Instant;
 use cocozero_rp2350::fat32::VirtualFat32Storage;
 use cocozero_rp2350::frontend::Frontend;
 
-use cocozero_rp2350::soc::{CoCoZeroSoC, FB_PIXELS};
+use cocozero_rp2350::soc::{CoCoZeroSoC, FB_PIXELS_640};
 use cocozero_rp2350::spi_sd::{FileStorage, MemoryStorage, SectorStorage};
 use cocozero_rp2350::uf2::{FlashImage, parse_uf2};
 
@@ -207,7 +207,7 @@ fn main() {
 
     // 6. Main Emulation Loop
     println!("Starting RP2350B execution loop...");
-    let mut fb_buffer = [0u16; FB_PIXELS];
+    let mut fb_buffer = vec![0u16; FB_PIXELS_640];
     let mut frame_count = 0u64;
     let start_time = Instant::now();
     let mut last_fps_time = Instant::now();
@@ -248,6 +248,18 @@ fn main() {
         // Drain HID keycodes for menu operation (F1..F12, navigation, drive selection)
         while let Some(hid_code) = frontend.hid_key_queue.pop_front() {
             soc.inject_hid_keycode(hid_code);
+        }
+
+        // Drain joystick events (analog axes and fire buttons)
+        for ev in frontend.drain_joystick_events() {
+            match ev {
+                cocozero_rp2350::frontend::JoystickEvent::Axis { port, axis, value } => {
+                    soc.set_joystick_axis(port, axis, value);
+                }
+                cocozero_rp2350::frontend::JoystickEvent::Fire { port, pressed } => {
+                    soc.set_joystick_fire(port, pressed);
+                }
+            }
         }
 
         // Forward physical key events (arrows, space, etc.)
@@ -330,7 +342,7 @@ fn main() {
         }
 
         // Extract and render framebuffer
-        soc.extract_frame(&mut fb_buffer);
+        soc.extract_frame_640(&mut fb_buffer);
         let _ = frontend.render_frame(&fb_buffer);
 
         // Screen dump capture if requested at current frame

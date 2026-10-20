@@ -22,8 +22,10 @@ use crate::uf2::FlashImage;
 
 pub const SYS_CLK_HZ: u32 = 252_000_000;
 pub const FB_WIDTH: usize = 320;
+pub const FB_WIDTH_640: usize = 640;
 pub const FB_HEIGHT: usize = 240;
 pub const FB_PIXELS: usize = FB_WIDTH * FB_HEIGHT;
+pub const FB_PIXELS_640: usize = FB_WIDTH_640 * FB_HEIGHT;
 pub const AUDIO_RING_SAMPLES: usize = 8192;
 
 pub struct CoCoZeroSoC {
@@ -41,6 +43,8 @@ pub struct CoCoZeroSoC {
     pub audio_samples_drained: u64,
     pub audio_lapped_samples: u64,
     pub turbo: u32,
+    pub prev_fdc_motor_on: bool,
+    pub motor_off_syncs: u64,
     dc_x1: i32,
     dc_y1: i64,
     dc_initialized: bool,
@@ -75,6 +79,11 @@ impl CoCoZeroSoC {
         }));
 
         let symbols = FirmwareSymbols::default();
+        let mut keyboard = KeyboardMatrix::new();
+        keyboard.matrix_addr = symbols.kb_matrix_addr;
+        keyboard.src_addr = symbols.kb_src_addr;
+        keyboard.src_ready_addr = symbols.kb_src_ready_addr;
+
         Ok(Self {
             emu,
             sd_card,
@@ -84,12 +93,14 @@ impl CoCoZeroSoC {
             frame_counter: 0,
             total_cycles: 0,
             keyboard_ready_forced: false,
-            keyboard: KeyboardMatrix::new(),
+            keyboard,
             symbols,
             host_audio_r: 0,
             audio_samples_drained: 0,
             audio_lapped_samples: 0,
             turbo: 1,
+            prev_fdc_motor_on: false,
+            motor_off_syncs: 0,
             dc_x1: 0,
             dc_y1: 0,
             dc_initialized: false,
@@ -114,6 +125,8 @@ impl CoCoZeroSoC {
         self.symbols = syms;
         self.fb_addr = Some(syms.fb_addr);
         self.keyboard.matrix_addr = syms.kb_matrix_addr;
+        self.keyboard.src_addr = syms.kb_src_addr;
+        self.keyboard.src_ready_addr = syms.kb_src_ready_addr;
 
         // If bootrom is not loaded, initialize core 0 registers directly from flash vector table
         if let (Some(sp), Some(pc)) = (flash.initial_sp, flash.entry_point) {
@@ -181,6 +194,54 @@ impl CoCoZeroSoC {
         self.keyboard.key_up(key);
     }
 
+    /// Update analog joystick axis (port: 0 [Right/primary] or 1 [Left], axis: 0 [X] or 1 [Y], value: 0..=65535, center: 32767).
+    pub fn set_joystick_axis(&mut self, port: usize, axis: usize, value: u16) {
+        if port > 1 || axis > 1 {
+            return;
+        }
+        if let Some(axis_base) = self.symbols.joy_axis_addr {
+            let offset = ((port * 2 + axis) * 2) as u32;
+            let target_addr = axis_base + offset;
+            if (0x2000_0000..0x2008_2000).contains(&target_addr) {
+                let sram_off = target_addr - 0x2000_0000;
+                self.emu.bus.memory.sram_write16(sram_off, value);
+            }
+        }
+    }
+
+    /// Update joystick fire button state (port: 0 [Right/primary] or 1 [Left], pressed: bool).
+    ///
+    /// Bit 0 of g_joy_fire corresponds to Port 0 (Right joystick fire on PIA0 PA0).
+    /// Bit 1 of g_joy_fire corresponds to Port 1 (Left joystick fire on PIA0 PA1).
+    pub fn set_joystick_fire(&mut self, port: usize, pressed: bool) {
+        if port > 1 {
+            return;
+        }
+        if let Some(fire_addr) = self.symbols.joy_fire_addr
+            && (0x2000_0000..0x2008_2000).contains(&fire_addr)
+        {
+            let sram_off = fire_addr - 0x2000_0000;
+            let current = self.emu.bus.memory.sram_read8(sram_off);
+            let mask = 1u8 << port;
+            let updated = if pressed {
+                current | mask
+            } else {
+                current & !mask
+            };
+            self.emu.bus.memory.sram_write8(sram_off, updated);
+        }
+    }
+
+    /// Release all joysticks (center all axes to 32767 and release fire buttons).
+    pub fn release_all_joysticks(&mut self) {
+        for port in 0..2 {
+            for axis in 0..2 {
+                self.set_joystick_axis(port, axis, 32767);
+            }
+            self.set_joystick_fire(port, false);
+        }
+    }
+
     /// Advance the SoC simulation by virtual cycles.
     pub fn step_cycles(&mut self, cycles: u64) -> Result<(), String> {
         self.update_sd_cs();
@@ -229,7 +290,51 @@ impl CoCoZeroSoC {
         let cycles_per_frame = ((SYS_CLK_HZ / 60) as u64) / (t as u64);
         self.step_cycles(cycles_per_frame)?;
         self.frame_counter += 1;
+        self.check_fdc_motor_sync();
         Ok(())
+    }
+
+    /// Read the current $FF40 floppy disk controller latch from guest state in SRAM.
+    pub fn get_fdc_latch(&self) -> Option<u8> {
+        let addr = self.symbols.fdc_latch_addr?;
+        if (0x2000_0000..0x2008_2000).contains(&addr) {
+            Some(self.emu.bus.memory.sram_read8(addr - 0x2000_0000))
+        } else {
+            None
+        }
+    }
+
+    /// Check whether the floppy disk drive spindle motor is currently energized ($FF40 bit 3 == 1).
+    pub fn is_spindle_motor_on(&self) -> bool {
+        (self.get_fdc_latch().unwrap_or(0) & 0x08) != 0
+    }
+
+    /// Read the currently selected floppy drive index (0..3) as tracked by firmware.
+    pub fn get_fdc_drive(&self) -> Option<u32> {
+        let addr = self.symbols.fdc_drive_addr?;
+        if (0x2000_0000..0x2008_2000).contains(&addr) {
+            Some(self.emu.bus.memory.sram_read32(addr - 0x2000_0000))
+        } else {
+            None
+        }
+    }
+
+    /// Check for floppy drive spindle motor shutoff ($FF40 bit 3: 1 -> 0).
+    ///
+    /// When guest operating systems (Disk BASIC / NitrOS-9) complete disk activity,
+    /// they clear bit 3 of the $FF40 latch. This 1 -> 0 transition triggers an immediate
+    /// flush of dirty virtual FAT32 sectors and directory metadata back to host files.
+    pub fn check_fdc_motor_sync(&mut self) -> bool {
+        let current_motor_on = self.is_spindle_motor_on();
+        let motor_shutoff = self.prev_fdc_motor_on && !current_motor_on;
+        self.prev_fdc_motor_on = current_motor_on;
+
+        if motor_shutoff {
+            self.motor_off_syncs += 1;
+            self.flush_storage()
+        } else {
+            false
+        }
     }
 
     /// Scan SRAM to discover the active 320×240 RGB565 framebuffer.
@@ -263,6 +368,51 @@ impl CoCoZeroSoC {
         None
     }
 
+    /// Check whether the guest system is a Color Computer 3 (CoCo 3).
+    pub fn is_coco3(&self) -> bool {
+        self.symbols.kb_matrix_addr == 0x2000_f200
+    }
+
+    /// Check whether the guest CoCo 3 display is currently in 640-wide mode (e.g. WIDTH 80).
+    pub fn is_wide_mode(&self) -> bool {
+        if !self.is_coco3() || self.is_menu_active() {
+            return false;
+        }
+
+        let gime_ptr_addr = self.symbols.gime3_ptr_addr.unwrap_or(0x2004_bbf0);
+        if !(0x2000_0000..0x2008_2000).contains(&gime_ptr_addr) {
+            return false;
+        }
+
+        let gime_addr = self.emu.bus.memory.sram_read32(gime_ptr_addr - 0x2000_0000);
+        if !(0x2000_0000..0x2008_2000).contains(&gime_addr) {
+            return false;
+        }
+
+        // VMODE ($FF98) at gime_addr + 0xFC + 8; VRES ($FF99) at gime_addr + 0xFC + 9
+        let reg8 = self
+            .emu
+            .bus
+            .memory
+            .sram_read8(gime_addr + 0x104 - 0x2000_0000);
+        let reg9 = self
+            .emu
+            .bus
+            .memory
+            .sram_read8(gime_addr + 0x105 - 0x2000_0000);
+
+        let bp = (reg8 & 0x80) != 0;
+        let hres = (reg9 >> 2) & 7;
+
+        if !bp {
+            // Text mode: (hres & 4) != 0 corresponds to 64 or 80 columns (resolution 2)
+            (hres & 4) != 0
+        } else {
+            // Graphics mode: resolution = hres >> 1; resolution >= 2 corresponds to 640-wide graphics
+            (hres >> 1) >= 2
+        }
+    }
+
     /// Extract the 320×240 RGB565 frame from SRAM for rendering.
     pub fn extract_frame(&mut self, out: &mut [u16; FB_PIXELS]) -> bool {
         let addr = self.fb_addr.unwrap_or(self.symbols.fb_addr);
@@ -272,6 +422,243 @@ impl CoCoZeroSoC {
             let val = mem.sram_read32(offset + (i as u32) * 4);
             out[i * 2] = val as u16;
             out[i * 2 + 1] = (val >> 16) as u16;
+        }
+        true
+    }
+
+    /// Extract a 640×240 RGB565 frame for crisp 1:1 rendering.
+    ///
+    /// If in 640-wide mode (e.g. CoCo 3 WIDTH 80 or 640-pixel graphics), this method
+    /// decodes the active VRAM characters and scanlines with full pixel precision.
+    /// In standard 320-wide modes, it doubles each 320-wide pixel horizontally.
+    pub fn extract_frame_640(&mut self, out: &mut [u16]) -> bool {
+        if out.len() < FB_PIXELS_640 {
+            return false;
+        }
+
+        if self.is_wide_mode() {
+            let gime_ptr_addr = self.symbols.gime3_ptr_addr.unwrap_or(0x2004_bbf0);
+            let c3bus_addr = self.symbols.c3bus_addr.unwrap_or(0x2001_0860);
+
+            let gime_addr = self.emu.bus.memory.sram_read32(gime_ptr_addr - 0x2000_0000);
+            let ram_lo = self.emu.bus.memory.sram_read32(c3bus_addr - 0x2000_0000);
+            let ram_hi = self
+                .emu
+                .bus
+                .memory
+                .sram_read32(c3bus_addr + 4 - 0x2000_0000);
+
+            let ram_lo_offset = ram_lo.saturating_sub(0x2000_0000);
+            let ram_hi_offset = ram_hi.saturating_sub(0x2000_0000);
+
+            // Read 64-entry RGB565 palette table from g_c3bus
+            let mut rgb64 = [0u16; 64];
+            for (i, entry) in rgb64.iter_mut().enumerate() {
+                *entry = self
+                    .emu
+                    .bus
+                    .memory
+                    .sram_read16(c3bus_addr + 24 + (i as u32) * 2 - 0x2000_0000);
+            }
+
+            // Read 16 palette registers from gime->palette_reg
+            let mut pal16 = [0u8; 16];
+            for (i, entry) in pal16.iter_mut().enumerate() {
+                *entry = self
+                    .emu
+                    .bus
+                    .memory
+                    .sram_read8(gime_addr + 0x148 + i as u32 - 0x2000_0000)
+                    & 0x3F;
+            }
+
+            let reg8 = self
+                .emu
+                .bus
+                .memory
+                .sram_read8(gime_addr + 0x104 - 0x2000_0000);
+            let reg9 = self
+                .emu
+                .bus
+                .memory
+                .sram_read8(gime_addr + 0x105 - 0x2000_0000);
+            let reg10 = self
+                .emu
+                .bus
+                .memory
+                .sram_read8(gime_addr + 0x106 - 0x2000_0000);
+            let reg13 = self
+                .emu
+                .bus
+                .memory
+                .sram_read8(gime_addr + 0x109 - 0x2000_0000) as u32;
+            let reg14 = self
+                .emu
+                .bus
+                .memory
+                .sram_read8(gime_addr + 0x10A - 0x2000_0000) as u32;
+
+            let bp = (reg8 & 0x80) != 0;
+            let lpr = reg8 & 7;
+            let lpf = (reg9 >> 5) & 3;
+            let cres = reg9 & 3;
+
+            let border_rgb = rgb64[(pal16[(reg10 & 15) as usize] & 63) as usize];
+            let vram_base = (reg13 << 11) | (reg14 << 3);
+
+            let sram = &self.emu.bus.memory;
+            let read_ram = |addr: u32| -> u8 {
+                let z = addr & 0x1FFFF;
+                let sram_off = if (z & 0x10000) != 0 {
+                    ram_hi_offset + (z & 0xFFFF)
+                } else {
+                    ram_lo_offset + (z & 0xFFFF)
+                };
+                if (sram_off as usize) < rp2350_emu::memory::SRAM_SIZE {
+                    sram.sram_read8(sram_off)
+                } else {
+                    0
+                }
+            };
+
+            if !bp {
+                // CoCo 3 80-Column Text Mode
+                let lines_per_char = match lpr {
+                    0 => 1,
+                    1 => 2,
+                    2 => 8,
+                    3 => 9,
+                    4 => 10,
+                    5 => 11,
+                    _ => 8,
+                };
+                let active_lines = match lpf {
+                    0 => 192,
+                    1 => 199,
+                    3 => 225,
+                    _ => 192,
+                };
+                let num_rows = (active_lines / lines_per_char).min(25);
+                let total_rendered_lines = num_rows * lines_per_char;
+                let y_start = ((240usize).saturating_sub(total_rendered_lines)) / 2;
+
+                // Fill border
+                out.fill(border_rgb);
+
+                let attr_mode = (cres & 1) != 0;
+
+                for row in 0..num_rows {
+                    for font_row in 0..lines_per_char {
+                        let y = y_start + row * lines_per_char + font_row;
+                        if y >= FB_HEIGHT {
+                            break;
+                        }
+                        let row_y_off = y * FB_WIDTH_640;
+                        for col in 0..80 {
+                            let cell_offset = if attr_mode {
+                                (row * 80 + col) * 2
+                            } else {
+                                row * 80 + col
+                            };
+                            let char_code =
+                                (read_ram(vram_base + cell_offset as u32) & 0x7F) as usize;
+                            let (fgi, bgi) = if attr_mode {
+                                let a = read_ram(vram_base + cell_offset as u32 + 1);
+                                (8 | ((a >> 3) & 7), a & 7)
+                            } else {
+                                (1, 0)
+                            };
+
+                            let fg_rgb = rgb64[(pal16[fgi as usize] & 63) as usize];
+                            let bg_rgb = rgb64[(pal16[bgi as usize] & 63) as usize];
+
+                            let font_line = if font_row < 12 {
+                                crate::font_gime::FONT_GIME[char_code * 12 + font_row]
+                            } else {
+                                0
+                            };
+
+                            let px_base = row_y_off + col * 8;
+                            for bit in 0..8 {
+                                let is_set = (font_line & (1 << (7 - bit))) != 0;
+                                out[px_base + bit] = if is_set { fg_rgb } else { bg_rgb };
+                            }
+                        }
+                    }
+                }
+                return true;
+            } else {
+                // CoCo 3 640-Pixel Graphics Mode
+                let active_lines = match lpf {
+                    0 => 192,
+                    1 => 199,
+                    3 => 225,
+                    _ => 192,
+                };
+                let y_start = ((240usize).saturating_sub(active_lines)) / 2;
+                out.fill(border_rgb);
+
+                if cres == 0 {
+                    // 1-bit per pixel (640×192, 2 colors)
+                    for line in 0..active_lines {
+                        let y = y_start + line;
+                        if y >= FB_HEIGHT {
+                            break;
+                        }
+                        let row_y_off = y * FB_WIDTH_640;
+                        let line_addr = vram_base + (line as u32) * 80;
+                        let fg_rgb = rgb64[(pal16[1] & 63) as usize];
+                        let bg_rgb = rgb64[(pal16[0] & 63) as usize];
+
+                        for bx in 0..80 {
+                            let b = read_ram(line_addr + bx as u32);
+                            let px_base = row_y_off + bx * 8;
+                            for bit in 0..8 {
+                                let is_set = (b & (1 << (7 - bit))) != 0;
+                                out[px_base + bit] = if is_set { fg_rgb } else { bg_rgb };
+                            }
+                        }
+                    }
+                    return true;
+                } else if cres == 1 {
+                    // 2-bit per pixel (640×192, 4 colors)
+                    for line in 0..active_lines {
+                        let y = y_start + line;
+                        if y >= FB_HEIGHT {
+                            break;
+                        }
+                        let row_y_off = y * FB_WIDTH_640;
+                        let line_addr = vram_base + (line as u32) * 160;
+
+                        for bx in 0..160 {
+                            let b = read_ram(line_addr + bx as u32);
+                            let px_base = row_y_off + bx * 4;
+                            let p0 = rgb64[(pal16[((b >> 6) & 3) as usize] & 63) as usize];
+                            let p1 = rgb64[(pal16[((b >> 4) & 3) as usize] & 63) as usize];
+                            let p2 = rgb64[(pal16[((b >> 2) & 3) as usize] & 63) as usize];
+                            let p3 = rgb64[(pal16[(b & 3) as usize] & 63) as usize];
+                            out[px_base] = p0;
+                            out[px_base + 1] = p1;
+                            out[px_base + 2] = p2;
+                            out[px_base + 3] = p3;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+
+        // Standard 320-wide fallback: double each pixel horizontally
+        let mut fb320 = [0u16; FB_PIXELS];
+        self.extract_frame(&mut fb320);
+        for y in 0..FB_HEIGHT {
+            let src_row = &fb320[y * FB_WIDTH..(y + 1) * FB_WIDTH];
+            let dst_row = &mut out[y * FB_WIDTH_640..(y + 1) * FB_WIDTH_640];
+            for x in 0..FB_WIDTH {
+                let px = src_row[x];
+                dst_row[x * 2] = px;
+                dst_row[x * 2 + 1] = px;
+            }
         }
         true
     }
@@ -475,15 +862,24 @@ impl CoCoZeroSoC {
                 sectors_read: sd_read,
                 sectors_written: sd_written,
                 flushes_performed: sd_flushes,
+                motor_off_syncs: self.motor_off_syncs,
             },
         }
     }
 
-    /// Extract the active 320×240 framebuffer and save it to a standard 24-bit BMP image.
+    /// Extract the active framebuffer and save it to a standard 24-bit BMP image.
+    /// In 640-wide modes (such as CoCo 3 WIDTH 80 or 640-pixel graphics), outputs a 640×240 BMP.
+    /// In standard modes, outputs a 320×240 BMP.
     pub fn dump_framebuffer_bmp(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let mut fb = [0u16; FB_PIXELS];
-        self.extract_frame(&mut fb);
-        save_bmp(path, &fb, FB_WIDTH, FB_HEIGHT)
+        if self.is_wide_mode() {
+            let mut fb = vec![0u16; FB_PIXELS_640];
+            self.extract_frame_640(&mut fb);
+            save_bmp(path, &fb, FB_WIDTH_640, FB_HEIGHT)
+        } else {
+            let mut fb = [0u16; FB_PIXELS];
+            self.extract_frame(&mut fb);
+            save_bmp(path, &fb, FB_WIDTH, FB_HEIGHT)
+        }
     }
 }
 
@@ -502,6 +898,7 @@ pub struct StorageTelemetry {
     pub sectors_read: u64,
     pub sectors_written: u64,
     pub flushes_performed: u64,
+    pub motor_off_syncs: u64,
 }
 
 /// Multi-core processor state and cycle telemetry.
@@ -529,7 +926,7 @@ impl fmt::Display for SocTelemetry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "[telemetry] frame={:>6} cycles={:>10} | C0: PC=0x{:08X} wfe={:<5} | C1: PC=0x{:08X} wfe={:<5} | Aud: drained={:<8} prod={:<8} lapped={:<4} wmark={:<4} | SD: r={:<6} w={:<6} flush={:<4}",
+            "[telemetry] frame={:>6} cycles={:>10} | C0: PC=0x{:08X} wfe={:<5} | C1: PC=0x{:08X} wfe={:<5} | Aud: drained={:<8} prod={:<8} lapped={:<4} wmark={:<4} | SD: r={:<6} w={:<6} flush={:<4} motor_sync={:<4}",
             self.frame,
             self.total_cycles,
             self.cores.core0_pc,
@@ -543,6 +940,7 @@ impl fmt::Display for SocTelemetry {
             self.storage.sectors_read,
             self.storage.sectors_written,
             self.storage.flushes_performed,
+            self.storage.motor_off_syncs,
         )
     }
 }

@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use sdl2::audio::{AudioQueue, AudioSpecDesired};
-use sdl2::controller::{Button, GameController};
+use sdl2::controller::{Axis, Button, GameController};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::PixelFormatEnum;
@@ -15,6 +15,7 @@ use sdl2::video::{Window, WindowContext};
 use sdl2::{EventPump, Sdl};
 
 pub const FRAME_WIDTH: usize = 320;
+pub const FRAME_WIDTH_640: usize = 640;
 pub const FRAME_HEIGHT: usize = 240;
 pub const DISPLAY_WIDTH: u32 = 640;
 pub const DISPLAY_HEIGHT: u32 = 480;
@@ -28,6 +29,19 @@ pub enum InputKeyEvent {
     Up(Keycode),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoystickEvent {
+    Axis {
+        port: usize,
+        axis: usize,
+        value: u16,
+    },
+    Fire {
+        port: usize,
+        pressed: bool,
+    },
+}
+
 pub struct Frontend {
     _sdl: Sdl,
     canvas: Canvas<Window>,
@@ -39,6 +53,7 @@ pub struct Frontend {
     pub serial_input_queue: Vec<u8>,
     pub typed_chars: VecDeque<char>,
     pub key_events: Vec<InputKeyEvent>,
+    pub joystick_events: Vec<JoystickEvent>,
     pub hid_key_queue: VecDeque<u8>,
     pub key_matrix: [u8; 8], // 8x8 CoCo keyboard matrix
     pub audio_queue_max_bytes: u32,
@@ -87,7 +102,7 @@ impl Frontend {
         let texture = texture_creator
             .create_texture_streaming(
                 PixelFormatEnum::RGB565,
-                FRAME_WIDTH as u32,
+                FRAME_WIDTH_640 as u32,
                 FRAME_HEIGHT as u32,
             )
             .map_err(|e| e.to_string())?;
@@ -143,6 +158,7 @@ impl Frontend {
             serial_input_queue: Vec::new(),
             typed_chars: VecDeque::new(),
             key_events: Vec::new(),
+            joystick_events: Vec::new(),
             hid_key_queue: VecDeque::new(),
             key_matrix: [0xFF; 8],
             audio_queue_max_bytes: AUDIO_QUEUE_MAX_BYTES,
@@ -156,25 +172,43 @@ impl Frontend {
         self.audio_queue_max_bytes = ms.max(10) * bytes_per_ms;
     }
 
-    /// Render a 320×240 RGB565 framebuffer from RP2350 SRAM.
+    /// Render an RGB565 framebuffer from RP2350 SRAM.
+    /// Supports both 640×240 (direct 1:1) and 320×240 (horizontal 2× pixel expansion).
     pub fn render_frame(&mut self, fb: &[u16]) -> Result<(), String> {
-        if fb.len() < FRAME_WIDTH * FRAME_HEIGHT {
+        if fb.len() >= FRAME_WIDTH_640 * FRAME_HEIGHT {
+            self.texture
+                .with_lock(None, |buffer: &mut [u8], pitch: usize| {
+                    for y in 0..FRAME_HEIGHT {
+                        let src_row = &fb[y * FRAME_WIDTH_640..(y + 1) * FRAME_WIDTH_640];
+                        let dst_row = &mut buffer[y * pitch..y * pitch + FRAME_WIDTH_640 * 2];
+                        for (x, &pixel) in src_row.iter().enumerate() {
+                            dst_row[x * 2] = (pixel & 0xFF) as u8;
+                            dst_row[x * 2 + 1] = ((pixel >> 8) & 0xFF) as u8;
+                        }
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+        } else if fb.len() >= FRAME_WIDTH * FRAME_HEIGHT {
+            self.texture
+                .with_lock(None, |buffer: &mut [u8], pitch: usize| {
+                    for y in 0..FRAME_HEIGHT {
+                        let src_row = &fb[y * FRAME_WIDTH..(y + 1) * FRAME_WIDTH];
+                        let dst_row = &mut buffer[y * pitch..y * pitch + FRAME_WIDTH_640 * 2];
+                        for (x, &pixel) in src_row.iter().enumerate() {
+                            let b0 = (pixel & 0xFF) as u8;
+                            let b1 = ((pixel >> 8) & 0xFF) as u8;
+                            let idx = x * 4;
+                            dst_row[idx] = b0;
+                            dst_row[idx + 1] = b1;
+                            dst_row[idx + 2] = b0;
+                            dst_row[idx + 3] = b1;
+                        }
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+        } else {
             return Err("Framebuffer size smaller than 320x240".to_string());
         }
-
-        self.texture
-            .with_lock(None, |buffer: &mut [u8], pitch: usize| {
-                for y in 0..FRAME_HEIGHT {
-                    let src_row = &fb[y * FRAME_WIDTH..(y + 1) * FRAME_WIDTH];
-                    let dst_row = &mut buffer[y * pitch..y * pitch + FRAME_WIDTH * 2];
-                    for x in 0..FRAME_WIDTH {
-                        let pixel = src_row[x];
-                        dst_row[x * 2] = (pixel & 0xFF) as u8;
-                        dst_row[x * 2 + 1] = ((pixel >> 8) & 0xFF) as u8;
-                    }
-                }
-            })
-            .map_err(|e| e.to_string())?;
 
         self.canvas.clear();
         self.canvas
@@ -197,6 +231,11 @@ impl Frontend {
     /// Drain and return any pending physical key events.
     pub fn drain_key_events(&mut self) -> Vec<InputKeyEvent> {
         std::mem::take(&mut self.key_events)
+    }
+
+    /// Drain and return any pending joystick events (analog axes and fire buttons).
+    pub fn drain_joystick_events(&mut self) -> Vec<JoystickEvent> {
+        std::mem::take(&mut self.joystick_events)
     }
 
     /// Poll SDL events and translate them to keyboard / control signals.
@@ -277,6 +316,9 @@ impl Frontend {
                 }
                 Event::ControllerButtonUp { button, .. } => {
                     self.handle_controller_button_up(button, is_menu_active);
+                }
+                Event::ControllerAxisMotion { axis, value, .. } => {
+                    self.handle_controller_axis_motion(axis, value, is_menu_active);
                 }
                 Event::MouseButtonDown { .. } => {
                     self.canvas.window_mut().raise();
@@ -527,8 +569,17 @@ impl Frontend {
                 Button::Y => {
                     self.typed_chars.push_back(' ');
                 }
-                Button::A | Button::RightShoulder => {
-                    self.key_events.push(InputKeyEvent::Down(Keycode::Space));
+                Button::A | Button::B | Button::RightShoulder => {
+                    self.joystick_events.push(JoystickEvent::Fire {
+                        port: 0,
+                        pressed: true,
+                    });
+                }
+                Button::X | Button::LeftShoulder => {
+                    self.joystick_events.push(JoystickEvent::Fire {
+                        port: 1,
+                        pressed: true,
+                    });
                 }
                 Button::DPadUp => {
                     self.typed_chars.push_back('^');
@@ -554,8 +605,17 @@ impl Frontend {
     pub fn handle_controller_button_up(&mut self, button: Button, is_menu_active: bool) {
         if !is_menu_active {
             match button {
-                Button::A | Button::RightShoulder => {
-                    self.key_events.push(InputKeyEvent::Up(Keycode::Space));
+                Button::A | Button::B | Button::RightShoulder => {
+                    self.joystick_events.push(JoystickEvent::Fire {
+                        port: 0,
+                        pressed: false,
+                    });
+                }
+                Button::X | Button::LeftShoulder => {
+                    self.joystick_events.push(JoystickEvent::Fire {
+                        port: 1,
+                        pressed: false,
+                    });
                 }
                 Button::DPadUp => {
                     self.key_events.push(InputKeyEvent::Up(Keycode::Up));
@@ -571,6 +631,54 @@ impl Frontend {
                 }
                 _ => {}
             }
+        }
+    }
+
+    pub fn handle_controller_axis_motion(&mut self, axis: Axis, value: i16, is_menu_active: bool) {
+        if is_menu_active {
+            return;
+        }
+        // DEADZONE = 1536 matches PAD_X_DEADZONE in upstream gamepad.h
+        const DEADZONE: i32 = 1536;
+        let v = value as i32;
+        let mapped = if v.abs() < DEADZONE {
+            32767u16
+        } else {
+            (v + 32768).clamp(0, 65535) as u16
+        };
+
+        match axis {
+            // Left Stick -> Port 0 (Right Joystick, primary CoCo port)
+            Axis::LeftX => {
+                self.joystick_events.push(JoystickEvent::Axis {
+                    port: 0,
+                    axis: 0,
+                    value: mapped,
+                });
+            }
+            Axis::LeftY => {
+                self.joystick_events.push(JoystickEvent::Axis {
+                    port: 0,
+                    axis: 1,
+                    value: mapped,
+                });
+            }
+            // Right Stick -> Port 1 (Left Joystick)
+            Axis::RightX => {
+                self.joystick_events.push(JoystickEvent::Axis {
+                    port: 1,
+                    axis: 0,
+                    value: mapped,
+                });
+            }
+            Axis::RightY => {
+                self.joystick_events.push(JoystickEvent::Axis {
+                    port: 1,
+                    axis: 1,
+                    value: mapped,
+                });
+            }
+            _ => {}
         }
     }
 }
