@@ -45,6 +45,8 @@ pub struct CoCoZeroSoC {
     pub turbo: u32,
     pub prev_fdc_motor_on: bool,
     pub motor_off_syncs: u64,
+    pub prev_volume: u8,
+    pub is_muted: bool,
     dc_x1: i32,
     dc_y1: i64,
     dc_initialized: bool,
@@ -62,6 +64,9 @@ impl CoCoZeroSoC {
 
         let sd_card = Arc::new(Mutex::new(SpiSdCard::new(sd_storage)));
         let serial_tx_log = Arc::new(Mutex::new(Vec::new()));
+
+        // Release POWMAN from reset so power manager and persistent scratch registers are active
+        emu.bus.resets_state &= !(1 << 17);
 
         // Wire SPI1 to SD card
         let sd_clone = Arc::clone(&sd_card);
@@ -101,6 +106,8 @@ impl CoCoZeroSoC {
             turbo: 1,
             prev_fdc_motor_on: false,
             motor_off_syncs: 0,
+            prev_volume: 10,
+            is_muted: false,
             dc_x1: 0,
             dc_y1: 0,
             dc_initialized: false,
@@ -211,8 +218,8 @@ impl CoCoZeroSoC {
 
     /// Update joystick fire button state (port: 0 [Right/primary] or 1 [Left], pressed: bool).
     ///
-    /// Bit 0 of g_joy_fire corresponds to Port 0 (Right joystick fire on PIA0 PA0).
-    /// Bit 1 of g_joy_fire corresponds to Port 1 (Left joystick fire on PIA0 PA1).
+    /// Bit 0 of g_joy_fire corresponds to Port 0 Fire 1 (Right joystick fire on PIA0 PA0).
+    /// Bit 1 of g_joy_fire corresponds to Port 1 Fire 1 (Left joystick fire on PIA0 PA1).
     pub fn set_joystick_fire(&mut self, port: usize, pressed: bool) {
         if port > 1 {
             return;
@@ -232,13 +239,46 @@ impl CoCoZeroSoC {
         }
     }
 
-    /// Release all joysticks (center all axes to 32767 and release fire buttons).
+    /// Update joystick secondary fire button state (port: 0 [Right/primary] or 1 [Left], pressed: bool).
+    ///
+    /// Bit 2 of g_joy_fire corresponds to Port 0 Fire 2 (Right joystick second fire on PIA0 PA2, CoCo 3).
+    /// Bit 3 of g_joy_fire corresponds to Port 1 Fire 2 (Left joystick second fire on PIA0 PA3, CoCo 3).
+    pub fn set_joystick_fire2(&mut self, port: usize, pressed: bool) {
+        if port > 1 {
+            return;
+        }
+        if let Some(fire_addr) = self.symbols.joy_fire_addr
+            && (0x2000_0000..0x2008_2000).contains(&fire_addr)
+        {
+            let sram_off = fire_addr - 0x2000_0000;
+            let current = self.emu.bus.memory.sram_read8(sram_off);
+            let mask = 4u8 << port;
+            let updated = if pressed {
+                current | mask
+            } else {
+                current & !mask
+            };
+            self.emu.bus.memory.sram_write8(sram_off, updated);
+        }
+    }
+
+    /// Update joystick fire button by button index (0 = primary fire, 1 = second fire).
+    pub fn set_joystick_fire_button(&mut self, port: usize, button: usize, pressed: bool) {
+        match button {
+            0 => self.set_joystick_fire(port, pressed),
+            1 => self.set_joystick_fire2(port, pressed),
+            _ => {}
+        }
+    }
+
+    /// Release all joysticks (center all axes to 32767 and release all fire buttons).
     pub fn release_all_joysticks(&mut self) {
         for port in 0..2 {
             for axis in 0..2 {
                 self.set_joystick_axis(port, axis, 32767);
             }
             self.set_joystick_fire(port, false);
+            self.set_joystick_fire2(port, false);
         }
     }
 
@@ -413,8 +453,36 @@ impl CoCoZeroSoC {
         }
     }
 
+    /// Check whether the active firmware uses 640×240 8bpp paletted scanout (VIDEO_640).
+    pub fn is_paletted(&self) -> bool {
+        self.symbols.pal565_addr.is_some()
+    }
+
     /// Extract the 320×240 RGB565 frame from SRAM for rendering.
     pub fn extract_frame(&mut self, out: &mut [u16; FB_PIXELS]) -> bool {
+        if let Some(pal_addr) = self.symbols.pal565_addr {
+            let fb_addr = self.fb_addr.unwrap_or(self.symbols.fb_addr);
+            let fb_offset = fb_addr.saturating_sub(0x2000_0000);
+            let pal_offset = pal_addr.saturating_sub(0x2000_0000);
+            let mem = &self.emu.bus.memory;
+
+            let mut pal = [0u16; 256];
+            for i in 0..256 {
+                pal[i] = mem.sram_read16(pal_offset + (i as u32) * 2);
+            }
+
+            // Downsample 640x240 to 320x240 by sampling every second pixel horizontally
+            for y in 0..FB_HEIGHT {
+                let line_start = fb_offset + (y * FB_WIDTH_640) as u32;
+                let out_line_start = y * FB_WIDTH;
+                for x in 0..FB_WIDTH {
+                    let idx = mem.sram_read8(line_start + (x * 2) as u32) as usize;
+                    out[out_line_start + x] = pal[idx];
+                }
+            }
+            return true;
+        }
+
         let addr = self.fb_addr.unwrap_or(self.symbols.fb_addr);
         let offset = addr.saturating_sub(0x2000_0000);
         let mem = &self.emu.bus.memory;
@@ -428,12 +496,40 @@ impl CoCoZeroSoC {
 
     /// Extract a 640×240 RGB565 frame for crisp 1:1 rendering.
     ///
-    /// If in 640-wide mode (e.g. CoCo 3 WIDTH 80 or 640-pixel graphics), this method
-    /// decodes the active VRAM characters and scanlines with full pixel precision.
-    /// In standard 320-wide modes, it doubles each 320-wide pixel horizontally.
+    /// In 640x240 paletted mode (VIDEO_640), this method translates single-byte pixel indices
+    /// in g_fb directly through g_pal565[256].
+    /// In legacy 16bpp firmware, it decodes CoCo 3 VRAM in wide mode, or doubles 320-wide pixels horizontally.
     pub fn extract_frame_640(&mut self, out: &mut [u16]) -> bool {
         if out.len() < FB_PIXELS_640 {
             return false;
+        }
+
+        // If pal565_addr is detected, the firmware uses VIDEO_640 paletted scanout:
+        // g_fb holds 640x240 single-byte color indices, mapped through g_pal565[256].
+        if let Some(pal_addr) = self.symbols.pal565_addr {
+            let fb_addr = self.fb_addr.unwrap_or(self.symbols.fb_addr);
+            let fb_offset = fb_addr.saturating_sub(0x2000_0000);
+            let pal_offset = pal_addr.saturating_sub(0x2000_0000);
+            let mem = &self.emu.bus.memory;
+
+            let mut pal = [0u16; 256];
+            for i in 0..256 {
+                pal[i] = mem.sram_read16(pal_offset + (i as u32) * 2);
+            }
+
+            for i in 0..(FB_PIXELS_640 / 4) {
+                let val32 = mem.sram_read32(fb_offset + (i as u32) * 4);
+                let b0 = (val32 & 0xFF) as usize;
+                let b1 = ((val32 >> 8) & 0xFF) as usize;
+                let b2 = ((val32 >> 16) & 0xFF) as usize;
+                let b3 = ((val32 >> 24) & 0xFF) as usize;
+                let base_idx = i * 4;
+                out[base_idx] = pal[b0];
+                out[base_idx + 1] = pal[b1];
+                out[base_idx + 2] = pal[b2];
+                out[base_idx + 3] = pal[b3];
+            }
+            return true;
         }
 
         if self.is_wide_mode() {
@@ -761,8 +857,107 @@ impl CoCoZeroSoC {
             .sram_read32(self.symbols.menu_mode_addr - 0x2000_0000)
     }
 
+    /// Read the active audio volume level (0..=15).
+    pub fn get_volume(&self) -> u8 {
+        if let Some(addr) = self.symbols.settings_addr {
+            if (0x2000_0000..0x2008_2000).contains(&addr) {
+                // In struct settings, byte offset 10 is volume
+                return self.emu.bus.memory.sram_read8(addr + 10 - 0x2000_0000);
+            }
+        }
+        self.prev_volume
+    }
+
+    /// Set the active audio volume level (0..=15) in SRAM and internal state.
+    pub fn set_volume(&mut self, vol: u8) {
+        let v = vol.min(15);
+        if let Some(addr) = self.symbols.settings_addr {
+            if (0x2000_0000..0x2008_2000).contains(&addr) {
+                self.emu.bus.memory.sram_write8(addr + 10 - 0x2000_0000, v);
+            }
+        }
+        if v > 0 {
+            self.prev_volume = v;
+            self.is_muted = false;
+        } else {
+            self.is_muted = true;
+        }
+    }
+
+    /// Process an HID Consumer volume key code:
+    /// 0xE9: Volume Up (+1)
+    /// 0xEA: Volume Down (-1)
+    /// 0xE2: Mute (toggle)
+    pub fn adjust_volume(&mut self, keycode: u8) -> u8 {
+        let current = self.get_volume();
+        let new_vol = match keycode {
+            0xE9 => {
+                // Volume Up
+                if self.is_muted {
+                    self.is_muted = false;
+                    self.prev_volume.max(1)
+                } else {
+                    current.saturating_add(1).min(15)
+                }
+            }
+            0xEA => {
+                // Volume Down
+                if self.is_muted {
+                    self.is_muted = false;
+                    self.prev_volume.saturating_sub(1)
+                } else {
+                    current.saturating_sub(1)
+                }
+            }
+            0xE2 => {
+                // Mute toggle
+                if self.is_muted {
+                    self.is_muted = false;
+                    self.prev_volume.max(1)
+                } else {
+                    self.prev_volume = current;
+                    self.is_muted = true;
+                    0
+                }
+            }
+            _ => current,
+        };
+        self.set_volume(new_vol);
+        new_vol
+    }
+
+    /// Drain complete serial telemetry lines received from UART0 console.
+    pub fn drain_serial_lines(&mut self) -> Vec<String> {
+        let mut log = self.serial_tx_log.lock().unwrap();
+        let bytes = log.as_slice();
+        let mut lines = Vec::new();
+        let mut start = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' {
+                let line_str = String::from_utf8_lossy(&bytes[start..=i]).trim().to_string();
+                if !line_str.is_empty() {
+                    lines.push(line_str);
+                }
+                start = i + 1;
+            }
+        }
+        let remainder = if start < bytes.len() {
+            bytes[start..].to_vec()
+        } else {
+            Vec::new()
+        };
+        *log = remainder;
+        lines
+    }
+
     /// Inject a USB HID keycode report into the firmware's TinyUSB host handler on Core 0.
     pub fn inject_hid_keycode(&mut self, keycode: u8) {
+        // If keycode is an HID Consumer multimedia volume key (0xE9, 0xEA, 0xE2), adjust volume
+        if keycode == 0xE9 || keycode == 0xEA || keycode == 0xE2 {
+            let v = self.adjust_volume(keycode);
+            eprintln!("[Audio] Volume adjusted to {} (keycode 0x{:02X})", v, keycode);
+        }
+
         // Trampoline at TRAMP_ADDR: 'b .' (0xE7FE)
         self.emu.bus.write16(TRAMP_ADDR, 0xE7FE, 0);
 
@@ -868,10 +1063,10 @@ impl CoCoZeroSoC {
     }
 
     /// Extract the active framebuffer and save it to a standard 24-bit BMP image.
-    /// In 640-wide modes (such as CoCo 3 WIDTH 80 or 640-pixel graphics), outputs a 640×240 BMP.
+    /// In 640-wide modes (such as VIDEO_640 paletted scanout, CoCo 3 WIDTH 80, or 640-pixel graphics), outputs a 640×240 BMP.
     /// In standard modes, outputs a 320×240 BMP.
     pub fn dump_framebuffer_bmp(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        if self.is_wide_mode() {
+        if self.is_paletted() || self.is_wide_mode() {
             let mut fb = vec![0u16; FB_PIXELS_640];
             self.extract_frame_640(&mut fb);
             save_bmp(path, &fb, FB_WIDTH_640, FB_HEIGHT)
@@ -879,6 +1074,250 @@ impl CoCoZeroSoC {
             let mut fb = [0u16; FB_PIXELS];
             self.extract_frame(&mut fb);
             save_bmp(path, &fb, FB_WIDTH, FB_HEIGHT)
+        }
+    }
+
+    /// Read the 8 hardware watchdog scratch registers (SCRATCH0..7 at 0x400D800C..=0x400D8028).
+    pub fn read_watchdog_scratch(&mut self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.emu.bus.read32(0x400D_8000 + 0x0C + (i as u32) * 4, 0);
+        }
+        out
+    }
+
+    /// Read the 8 hardware powman scratch registers (SCRATCH0..7 at 0x401000B0..=0x401000CC).
+    pub fn read_powman_scratch(&mut self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.emu.bus.read32(0x4010_0000 + 0xB0 + (i as u32) * 4, 0);
+        }
+        out
+    }
+
+    /// Read and parse persistent hardware watchdog and powman post-mortem crash diagnostics.
+    pub fn read_watchdog_post_mortem(&mut self) -> Option<WatchdogPostMortem> {
+        let wd = self.read_watchdog_scratch();
+        let pw = self.read_powman_scratch();
+        WatchdogPostMortem::parse(wd, pw)
+    }
+
+    /// Format watchdog post-mortem record if present.
+    pub fn format_post_mortem(&mut self) -> Option<String> {
+        self.read_watchdog_post_mortem().map(|pm| pm.describe())
+    }
+}
+
+/// Watchdog Sentinel distinguishing valid freeze records from cold power-on state (`0x05330534`).
+pub const WD_MAGIC: u32 = 0x05330534;
+/// Powman Post-Mortem Sentinel confirming valid post-mortem record (`0x57445031` = 'WDP1').
+pub const WDP_MAGIC: u32 = 0x57445031;
+/// Sentinel indicating deliberate USB replug reboot (`0x51D15C09`).
+pub const USB_REPLUG_MAGIC: u32 = 0x51D15C09;
+/// Sentinel indicating deliberate machine switch reboot (`0x53574954` = 'SWIT').
+pub const MACHINE_SWITCH_MAGIC: u32 = 0x53574954;
+
+pub const WP_SETUP: u32 = 1;
+pub const WP_LOOP: u32 = 2;
+pub const WP_USB: u32 = 3;
+pub const WP_KBD: u32 = 4;
+pub const WP_EMU: u32 = 5;
+pub const WP_RENDER: u32 = 6;
+pub const WP_BLIT: u32 = 7;
+pub const WP_AUDIO: u32 = 8;
+pub const WP_PACE: u32 = 9;
+pub const WP_TELEM: u32 = 10;
+pub const WP_SOAKLOG: u32 = 11;
+
+pub const WDP_NONE: u32 = 0;
+pub const WDP_ARMED: u32 = 1;
+pub const WDP_HANG: u32 = 2;
+pub const WDP_FAULT: u32 = 3;
+
+/// Translate execution phase enum constant to human-readable string.
+pub fn phase_name(phase: u32) -> &'static str {
+    match phase {
+        WP_SETUP => "WP_SETUP",
+        WP_LOOP => "WP_LOOP",
+        WP_USB => "WP_USB",
+        WP_KBD => "WP_KBD",
+        WP_EMU => "WP_EMU",
+        WP_RENDER => "WP_RENDER",
+        WP_BLIT => "WP_BLIT",
+        WP_AUDIO => "WP_AUDIO",
+        WP_PACE => "WP_PACE",
+        WP_TELEM => "WP_TELEM",
+        WP_SOAKLOG => "WP_SOAKLOG",
+        _ => "WP_UNKNOWN",
+    }
+}
+
+/// Translate ARM exception/interrupt number to descriptive name.
+pub fn irq_name(exc: u32) -> String {
+    match exc {
+        0 => "thread mode (no interrupt)".to_string(),
+        3 => "HardFault".to_string(),
+        11 => "SVCall".to_string(),
+        14 => "PendSV".to_string(),
+        15 => "SysTick".to_string(),
+        1..=15 => "a system exception".to_string(),
+        _ => {
+            let irq = exc - 16;
+            match irq {
+                0..=3 => format!("TIMER0_IRQ_{}", irq),
+                10..=13 => format!("DMA_IRQ_{}", irq - 10),
+                14 => "USBCTRL_IRQ".to_string(),
+                15 => "PIO0_IRQ_0".to_string(),
+                16 => "PIO0_IRQ_1".to_string(),
+                17 => "PIO1_IRQ_0".to_string(),
+                18 => "PIO1_IRQ_1".to_string(),
+                21 => "IO_IRQ_BANK0".to_string(),
+                25 => "SIO_IRQ_FIFO".to_string(),
+                26 => "SIO_IRQ_BELL".to_string(),
+                33 => "UART0_IRQ".to_string(),
+                _ => format!("IRQ {}", irq),
+            }
+        }
+    }
+}
+
+/// Decoded hardware watchdog and powman post-mortem diagnostic record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchdogPostMortem {
+    pub raw_watchdog: [u32; 8],
+    pub raw_powman: [u32; 8],
+    pub wd_magic: u32,
+    pub phase: u32,
+    pub phase_name: &'static str,
+    pub heartbeat_frames: u32,
+    pub cumulative_freeze_count: u32,
+    pub last_freeze_phase: u32,
+    pub usb_replug_magic: u32,
+    pub fault_pc: u32,
+    pub fault_lr: u32,
+    pub kind: u32,
+    pub core: u32,
+    pub saves: u32,
+    pub exception_num: u32,
+    pub uptime_ms: u32,
+    pub span_ms: u32,
+    pub core1_lines: u32,
+    pub guest_6809_pc: u16,
+    pub usb_devices: u8,
+    pub exc_return: u8,
+    pub nvic_or_fault: [u32; 4],
+}
+
+impl WatchdogPostMortem {
+    /// Parse raw scratch register arrays into structured diagnostic fields.
+    pub fn parse(wd: [u32; 8], pw: [u32; 8]) -> Option<Self> {
+        let wd_magic = wd[0];
+        let pw_magic = pw[7];
+        if wd_magic != WD_MAGIC && pw_magic != WDP_MAGIC {
+            return None;
+        }
+
+        let phase = wd[1];
+        let heartbeat_frames = wd[2];
+        let cumulative_freeze_count = wd[3] >> 8;
+        let last_freeze_phase = wd[3] & 0xFF;
+        let usb_replug_magic = wd[4];
+        let fault_pc = wd[5];
+        let fault_lr = wd[6];
+        let s7 = wd[7];
+        let kind = s7 >> 24;
+        let core = (s7 >> 20) & 0xF;
+        let saves = (s7 >> 12) & 0xFF;
+        let exception_num = s7 & 0x1FF;
+
+        let uptime_ms = pw[0];
+        let span_ms = pw[1] >> 16;
+        let core1_lines = pw[1] & 0xFFFF;
+        let guest_6809_pc = (pw[2] >> 16) as u16;
+        let usb_devices = ((pw[2] >> 8) & 0xFF) as u8;
+        let exc_return = (pw[2] & 0xFF) as u8;
+        let nvic_or_fault = [pw[3], pw[4], pw[5], pw[6]];
+
+        Some(Self {
+            raw_watchdog: wd,
+            raw_powman: pw,
+            wd_magic,
+            phase,
+            phase_name: phase_name(phase),
+            heartbeat_frames,
+            cumulative_freeze_count,
+            last_freeze_phase,
+            usb_replug_magic,
+            fault_pc,
+            fault_lr,
+            kind,
+            core,
+            saves,
+            exception_num,
+            uptime_ms,
+            span_ms,
+            core1_lines,
+            guest_6809_pc,
+            usb_devices,
+            exc_return,
+            nvic_or_fault,
+        })
+    }
+
+    /// Format the diagnostic record into an authoritative post-mortem log matching silicon firmware output.
+    pub fn describe(&self) -> String {
+        let pw_magic = self.raw_powman[7];
+        let kind = self.kind;
+
+        if pw_magic != WDP_MAGIC || kind == WDP_NONE || kind > WDP_FAULT {
+            if self.wd_magic == WD_MAGIC {
+                let c1_status = if self.core1_lines > 0 { "alive" } else { "stopped" };
+                return format!(
+                    "[watchdog] post-mortem: core {} stuck at 0x{:08x} in {} (6809 PC=0x{:04X}, core 1 {})",
+                    self.core, self.fault_pc, self.phase_name, self.guest_6809_pc, c1_status
+                );
+            }
+            return "[watchdog] post-mortem: no record (a power-on, or a build before PIZERO-227)".to_string();
+        }
+
+        if kind == WDP_ARMED {
+            return "[watchdog] post-mortem: the early warning never ran: core 0 had interrupts masked, was in a top-priority handler, or the bus stalled".to_string();
+        }
+
+        let irq_str = irq_name(self.exception_num);
+        if kind == WDP_FAULT {
+            let cfsr = self.nvic_or_fault[0];
+            let hfsr = self.nvic_or_fault[1];
+            let bfar = if (cfsr & (1 << 15)) != 0 {
+                format!(" bfar={:08x}", self.nvic_or_fault[2])
+            } else {
+                String::new()
+            };
+            let mmfar = if (cfsr & (1 << 7)) != 0 {
+                format!(" mmfar={:08x}", self.nvic_or_fault[3])
+            } else {
+                String::new()
+            };
+            format!(
+                "[watchdog] post-mortem: HARD FAULT on core {} pc={:08x} lr={:08x} in {} cfsr={:08x} hfsr={:08x}{}{} exc_return=..{:02x} guest_pc={:04x} usb={} up={}ms",
+                self.core, self.fault_pc, self.fault_lr, irq_str, cfsr, hfsr, bfar, mmfar,
+                self.exc_return, self.guest_6809_pc, self.usb_devices, self.uptime_ms
+            )
+        } else {
+            // WDP_HANG
+            let c1_status = if self.saves < 2 {
+                "unknown"
+            } else if self.core1_lines > 0 {
+                "running"
+            } else {
+                "STOPPED"
+            };
+            format!(
+                "[watchdog] post-mortem: hang, core 0 at pc={:08x} lr={:08x} in {}; {} warnings over {} ms, core 1 {} (+{} lines); active={:05x}:{:08x} pending={:05x}:{:08x} exc_return=..{:02x}; guest_pc={:04x} usb={} up={}ms",
+                self.fault_pc, self.fault_lr, irq_str, self.saves, self.span_ms, c1_status, self.core1_lines,
+                self.nvic_or_fault[1], self.nvic_or_fault[0], self.nvic_or_fault[3], self.nvic_or_fault[2],
+                self.exc_return, self.guest_6809_pc, self.usb_devices, self.uptime_ms
+            )
         }
     }
 }
@@ -1014,3 +1453,50 @@ pub const HID_REPORT_ADDR: u32 = 0x2001_c18c;
 pub const HID_CB_ADDR: u32 = 0x1001_f3a4;
 /// Scratch trampoline location in upper SRAM.
 pub const TRAMP_ADDR: u32 = 0x2007_ffe0;
+
+/// Structured serial telemetry record parsed from live firmware UART0 stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TelemetryRecord {
+    /// Core 0 runtime and frame budget performance (`[run]`)
+    Run(String),
+    /// Audio ring buffer watermark and drain adjustments (`[aud]`)
+    Audio(String),
+    /// SN76489 Complex Sound Generator updates (`[csg]`)
+    Csg(String),
+    /// AY-3-8910 multi-chip sound bank updates (`[ay]`)
+    Ay(String),
+    /// Orchestra-90CC 8-bit stereo DAC writes (`[orch]`)
+    Orch(String),
+    /// USB Audio Class streaming delivery and pacing (`[uac]`)
+    Uac(String),
+    /// Applied configuration settings and volume level (`[settings]`)
+    Settings(String),
+    /// Unclassified bracketed telemetry record
+    Other(String),
+}
+
+impl TelemetryRecord {
+    /// Parse a single console line into a categorized telemetry record.
+    pub fn parse_line(line: &str) -> Option<Self> {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[run]") {
+            Some(TelemetryRecord::Run(trimmed.to_string()))
+        } else if trimmed.starts_with("[aud]") {
+            Some(TelemetryRecord::Audio(trimmed.to_string()))
+        } else if trimmed.starts_with("[csg]") {
+            Some(TelemetryRecord::Csg(trimmed.to_string()))
+        } else if trimmed.starts_with("[ay]") {
+            Some(TelemetryRecord::Ay(trimmed.to_string()))
+        } else if trimmed.starts_with("[orch]") {
+            Some(TelemetryRecord::Orch(trimmed.to_string()))
+        } else if trimmed.starts_with("[uac]") {
+            Some(TelemetryRecord::Uac(trimmed.to_string()))
+        } else if trimmed.starts_with("[settings]") {
+            Some(TelemetryRecord::Settings(trimmed.to_string()))
+        } else if trimmed.starts_with('[') && trimmed.contains(']') {
+            Some(TelemetryRecord::Other(trimmed.to_string()))
+        } else {
+            None
+        }
+    }
+}

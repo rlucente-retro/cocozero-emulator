@@ -12,6 +12,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirmwareSymbols {
     pub fb_addr: u32,
+    pub pal565_addr: Option<u32>,
     pub kb_matrix_addr: u32,
     pub kb_src_addr: Option<u32>,
     pub kb_src_ready_addr: Option<u32>,
@@ -29,12 +30,14 @@ pub struct FirmwareSymbols {
     pub g_m_addr: Option<u32>,
     pub fdc_latch_addr: Option<u32>,
     pub fdc_drive_addr: Option<u32>,
+    pub settings_addr: Option<u32>,
 }
 
 impl Default for FirmwareSymbols {
     fn default() -> Self {
         Self {
             fb_addr: 0x2002_2780,
+            pal565_addr: None,
             kb_matrix_addr: 0x2000_b304,
             kb_src_addr: Some(0x2004_b81c),
             kb_src_ready_addr: Some(0x2006_0450),
@@ -52,6 +55,7 @@ impl Default for FirmwareSymbols {
             g_m_addr: Some(0x2001_c2cc),
             fdc_latch_addr: Some(0x2001_c2f9),
             fdc_drive_addr: Some(0x2001_c404),
+            settings_addr: Some(0x2001_774c),
         }
     }
 }
@@ -144,6 +148,9 @@ impl FirmwareSymbols {
         if let Some(&addr) = syms.get("_ZL4g_fb").or_else(|| syms.get("g_fb")) {
             res.fb_addr = addr;
         }
+        if let Some(&addr) = syms.get("_ZL8g_pal565").or_else(|| syms.get("g_pal565")) {
+            res.pal565_addr = Some(addr);
+        }
         if let Some(&addr) = syms
             .get("_ZL17g_kb_col_row_mask")
             .or_else(|| syms.get("g_kb_col_row_mask"))
@@ -201,6 +208,12 @@ impl FirmwareSymbols {
             res.g_m_addr = Some(addr);
             res.fdc_latch_addr = Some(addr + 0x2D);
             res.fdc_drive_addr = Some(addr + 0x138);
+        }
+        if let Some(&addr) = syms
+            .get("_ZL10g_settings")
+            .or_else(|| syms.get("g_settings"))
+        {
+            res.settings_addr = Some(addr);
         }
 
         Ok(res)
@@ -299,6 +312,13 @@ impl FirmwareSymbols {
                     res.fb_addr = candidate;
                 }
             }
+            if lit_off + 8 <= flash_bytes.len() {
+                let candidate2 =
+                    u32::from_le_bytes(flash_bytes[lit_off + 4..lit_off + 8].try_into().unwrap());
+                if (0x2000_0000..=0x2008_0000).contains(&candidate2) && candidate2 != res.fb_addr {
+                    res.pal565_addr = Some(candidate2);
+                }
+            }
         }
 
         // 5. Scan for audio ring buffer literal pool:
@@ -348,6 +368,7 @@ impl FirmwareSymbols {
         if res.kb_matrix_addr == 0x2000_f200 {
             res.c3bus_addr = Some(0x2001_0860);
             res.gime3_ptr_addr = Some(0x2004_bbf0);
+            res.settings_addr = Some(0x2001_f71c);
             if res.g_m_addr.is_none() {
                 res.g_m_addr = Some(0x2002_3b3c);
                 res.fdc_latch_addr = Some(0x2002_3b69);
@@ -468,6 +489,7 @@ mod tests {
         assert_eq!(syms.g_m_addr, Some(0x2001_c2cc));
         assert_eq!(syms.fdc_latch_addr, Some(0x2001_c2f9));
         assert_eq!(syms.fdc_drive_addr, Some(0x2001_c404));
+        assert_eq!(syms.settings_addr, Some(0x2001_774c));
 
         let c3_elf = Path::new("roms/cocozero-coco3.elf");
         if c3_elf.exists() {
@@ -480,6 +502,7 @@ mod tests {
             assert_eq!(c3_syms.g_m_addr, Some(0x2002_3b3c));
             assert_eq!(c3_syms.fdc_latch_addr, Some(0x2002_3b69));
             assert_eq!(c3_syms.fdc_drive_addr, Some(0x2002_3c74));
+            assert_eq!(c3_syms.settings_addr, Some(0x2001_f71c));
         }
     }
 
@@ -509,5 +532,6 @@ mod tests {
         assert_eq!(syms.g_m_addr, Some(0x2001_c2cc));
         assert_eq!(syms.fdc_latch_addr, Some(0x2001_c2f9));
         assert_eq!(syms.fdc_drive_addr, Some(0x2001_c404));
+        assert_eq!(syms.settings_addr, Some(0x2001_774c));
     }
 }

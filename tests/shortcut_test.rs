@@ -371,6 +371,34 @@ fn test_frontend_shortcuts_and_gamepad() {
         "Gamepad analog axis sweeps map correctly"
     );
 
+    // Gamepad analog triggers (R2/L2) -> Fire 2
+    frontend.handle_controller_axis_motion(Axis::TriggerRight, 16384, false);
+    frontend.handle_controller_axis_motion(Axis::TriggerLeft, 20000, false);
+    frontend.handle_controller_axis_motion(Axis::TriggerRight, 8000, false);
+    frontend.handle_controller_axis_motion(Axis::TriggerLeft, 0, false);
+    assert_eq!(
+        frontend.drain_joystick_events(),
+        vec![
+            JoystickEvent::Fire2 {
+                port: 0,
+                pressed: true,
+            },
+            JoystickEvent::Fire2 {
+                port: 1,
+                pressed: true,
+            },
+            JoystickEvent::Fire2 {
+                port: 0,
+                pressed: false,
+            },
+            JoystickEvent::Fire2 {
+                port: 1,
+                pressed: false,
+            },
+        ],
+        "Gamepad triggers map to Fire 2 with >= 16384 threshold"
+    );
+
     // 6. Verify render_frame handles both 640x240 and 320x240
     let fb640 = vec![0u16; 640 * 240];
     assert!(
@@ -381,6 +409,28 @@ fn test_frontend_shortcuts_and_gamepad() {
     assert!(
         frontend.render_frame(&fb320).is_ok(),
         "Render 320x240 frame succeeds (expanded 2x)"
+    );
+
+    // 7. Verify Consumer multimedia volume keys
+    frontend.handle_key_down(Keycode::VolumeUp, false, false, false, false);
+    assert_eq!(
+        frontend.hid_key_queue.pop_front(),
+        Some(0xE9),
+        "VolumeUp -> HID Consumer 0xE9"
+    );
+
+    frontend.handle_key_down(Keycode::VolumeDown, false, false, false, false);
+    assert_eq!(
+        frontend.hid_key_queue.pop_front(),
+        Some(0xEA),
+        "VolumeDown -> HID Consumer 0xEA"
+    );
+
+    frontend.handle_key_down(Keycode::Mute, false, false, false, false);
+    assert_eq!(
+        frontend.hid_key_queue.pop_front(),
+        Some(0xE2),
+        "Mute -> HID Consumer 0xE2"
     );
 }
 
@@ -664,6 +714,36 @@ fn test_joystick_axis_and_fire_integration() {
         0x00,
         "Fire buttons cleared"
     );
+
+    // Test Secondary Fire Buttons (bits 2 & 3):
+    soc.set_joystick_fire2(0, true);
+    assert_eq!(
+        soc.emu.bus.memory.sram_read8(fire_addr - 0x2000_0000),
+        0x04,
+        "Port 0 Fire 2 asserted (bit 2)"
+    );
+
+    soc.set_joystick_fire2(1, true);
+    assert_eq!(
+        soc.emu.bus.memory.sram_read8(fire_addr - 0x2000_0000),
+        0x0C,
+        "Both Fire 2 buttons asserted (bits 2 and 3)"
+    );
+
+    // Fire button helper by index (0 = primary, 1 = secondary)
+    soc.set_joystick_fire_button(0, 0, true); // Fire 1 Port 0 -> bit 0
+    assert_eq!(
+        soc.emu.bus.memory.sram_read8(fire_addr - 0x2000_0000),
+        0x0D,
+        "Fire 1 + Fire 2 on Port 0, Fire 2 on Port 1"
+    );
+
+    soc.release_all_joysticks();
+    assert_eq!(
+        soc.emu.bus.memory.sram_read8(fire_addr - 0x2000_0000),
+        0x00,
+        "All fire buttons (Fire 1 and Fire 2) cleared"
+    );
     for port in 0..2 {
         for axis in 0..2 {
             let offset = ((port * 2 + axis) * 2) as u32;
@@ -845,4 +925,89 @@ fn test_coco3_wide_mode_and_640_display() {
     assert_eq!(width, 640, "BMP width is 640");
     assert_eq!(height, 240, "BMP height is 240");
     let _ = std::fs::remove_file(tmp_bmp);
+}
+
+#[test]
+fn test_coco3_native_keys() {
+    use cocozero_rp2350::keyboard::{
+        dscan_to_row_col, keycode_to_dscan, K_ALT, K_CTRL, K_F1, K_F2,
+    };
+    use sdl2::keyboard::Keycode;
+
+    assert_eq!(keycode_to_dscan(Keycode::LCtrl), Some(K_CTRL));
+    assert_eq!(keycode_to_dscan(Keycode::RCtrl), Some(K_CTRL));
+    assert_eq!(keycode_to_dscan(Keycode::LAlt), Some(K_ALT));
+    assert_eq!(keycode_to_dscan(Keycode::RAlt), Some(K_ALT));
+    assert_eq!(keycode_to_dscan(Keycode::F1), Some(K_F1));
+    assert_eq!(keycode_to_dscan(Keycode::F2), Some(K_F2));
+
+    // Verify row 6 mapping for CoCo 3 native keys
+    assert_eq!(dscan_to_row_col(K_ALT), (6, 3));
+    assert_eq!(dscan_to_row_col(K_CTRL), (6, 4));
+    assert_eq!(dscan_to_row_col(K_F1), (6, 5));
+    assert_eq!(dscan_to_row_col(K_F2), (6, 6));
+}
+
+#[test]
+fn test_soc_volume_control() {
+    use cocozero_rp2350::soc::CoCoZeroSoC;
+    use cocozero_rp2350::spi_sd::MemoryStorage;
+
+    // Test SoC volume adjustment logic and SRAM synchronization
+    let storage = Box::new(MemoryStorage::new(1024 * 1024));
+    let mut soc = CoCoZeroSoC::new(storage).expect("Init SoC");
+
+    let settings_addr = soc.symbols.settings_addr.expect("settings_addr present");
+    // Initial volume is 10
+    soc.set_volume(10);
+    assert_eq!(soc.get_volume(), 10);
+    assert_eq!(
+        soc.emu.bus.memory.sram_read8(settings_addr + 10 - 0x2000_0000),
+        10
+    );
+
+    // Volume Up (0xE9) -> 11
+    let v_up = soc.adjust_volume(0xE9);
+    assert_eq!(v_up, 11);
+    assert_eq!(soc.get_volume(), 11);
+    assert_eq!(
+        soc.emu.bus.memory.sram_read8(settings_addr + 10 - 0x2000_0000),
+        11
+    );
+
+    // Volume Down (0xEA) -> 10
+    let v_down = soc.adjust_volume(0xEA);
+    assert_eq!(v_down, 10);
+    assert_eq!(soc.get_volume(), 10);
+
+    // Mute (0xE2) -> 0
+    let v_mute = soc.adjust_volume(0xE2);
+    assert_eq!(v_mute, 0);
+    assert_eq!(soc.get_volume(), 0);
+    assert!(soc.is_muted);
+
+    // Unmute with Volume Up -> back to 10
+    let v_unmute = soc.adjust_volume(0xE9);
+    assert_eq!(v_unmute, 10);
+    assert_eq!(soc.get_volume(), 10);
+    assert!(!soc.is_muted);
+
+    // Volume clamping at upper limit 15
+    soc.set_volume(15);
+    let v_clamp = soc.adjust_volume(0xE9);
+    assert_eq!(v_clamp, 15);
+
+    // Un-mute with Volume Down restores 15 and steps down to 14
+    let _ = soc.adjust_volume(0xE2); // Mute
+    assert!(soc.is_muted);
+    let v_down_unmute = soc.adjust_volume(0xEA); // Unmutes to 15, then decrements to 14
+    assert_eq!(v_down_unmute, 14);
+    assert!(!soc.is_muted);
+
+    // Stepping down to 0 clamps at 0
+    soc.set_volume(1);
+    let v_down1 = soc.adjust_volume(0xEA);
+    assert_eq!(v_down1, 0);
+    let v_down0 = soc.adjust_volume(0xEA);
+    assert_eq!(v_down0, 0);
 }

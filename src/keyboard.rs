@@ -37,6 +37,10 @@ pub const K_SPACE: u8 = 0x2F;
 pub const K_ENTER: u8 = 0x30;
 pub const K_CLEAR: u8 = 0x31;
 pub const K_BREAK: u8 = 0x32;
+pub const K_ALT: u8 = 0x33;   // CoCo 3 native Alt (Row 6, Bit 3)
+pub const K_CTRL: u8 = 0x34;  // CoCo 3 native Ctrl (Row 6, Bit 4)
+pub const K_F1: u8 = 0x35;    // CoCo 3 native F1 (Row 6, Bit 5)
+pub const K_F2: u8 = 0x36;    // CoCo 3 native F2 (Row 6, Bit 6)
 pub const K_SHIFT: u8 = 0x37;
 pub const K_INVALID: u8 = 0x3F;
 
@@ -165,6 +169,10 @@ pub fn keycode_to_dscan(key: Keycode) -> Option<u8> {
         Keycode::Left => Some(K_LEFT),
         Keycode::Right => Some(K_RIGHT),
         Keycode::LShift | Keycode::RShift => Some(K_SHIFT),
+        Keycode::LCtrl | Keycode::RCtrl => Some(K_CTRL),
+        Keycode::LAlt | Keycode::RAlt => Some(K_ALT),
+        Keycode::F1 => Some(K_F1),
+        Keycode::F2 => Some(K_F2),
         Keycode::Home => Some(K_CLEAR),
         k => crate::frontend::keycode_to_char(k, false).and_then(|c| kt_chord(c).map(|(d, _)| d)),
     }

@@ -40,6 +40,10 @@ pub enum JoystickEvent {
         port: usize,
         pressed: bool,
     },
+    Fire2 {
+        port: usize,
+        pressed: bool,
+    },
 }
 
 pub struct Frontend {
@@ -373,6 +377,21 @@ impl Frontend {
             self.hid_key_queue.push_back(0x46); // HID PrintScreen
             return;
         }
+        if key == Keycode::VolumeUp {
+            eprintln!("[Audio] VolumeUp -> HID Consumer 0xE9");
+            self.hid_key_queue.push_back(0xE9);
+            return;
+        }
+        if key == Keycode::VolumeDown {
+            eprintln!("[Audio] VolumeDown -> HID Consumer 0xEA");
+            self.hid_key_queue.push_back(0xEA);
+            return;
+        }
+        if key == Keycode::Mute {
+            eprintln!("[Audio] Mute -> HID Consumer 0xE2");
+            self.hid_key_queue.push_back(0xE2);
+            return;
+        }
 
         // 2. When menu overlay is active, route navigation and dialog keys directly to menu
         if is_menu_active {
@@ -678,7 +697,20 @@ impl Frontend {
                     value: mapped,
                 });
             }
-            _ => {}
+            // Triggers -> CoCo 3 Second Fire buttons (Fire2)
+            // Evaluates analog threshold >= 16384 (50% pull, corresponding to >= 128 on 8-bit scale)
+            Axis::TriggerRight => {
+                self.joystick_events.push(JoystickEvent::Fire2 {
+                    port: 0,
+                    pressed: value >= 16384,
+                });
+            }
+            Axis::TriggerLeft => {
+                self.joystick_events.push(JoystickEvent::Fire2 {
+                    port: 1,
+                    pressed: value >= 16384,
+                });
+            }
         }
     }
 }

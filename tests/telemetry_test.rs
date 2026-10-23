@@ -130,3 +130,88 @@ fn test_script_and_type_command_processing() {
         kbd.type_char(mapped);
     }
 }
+
+#[test]
+fn test_telemetry_stream_parsing() {
+    use cocozero_rp2350::soc::TelemetryRecord;
+
+    let run_line = "[run] fps=60.0 cpu=6210us blit=1612us aud=0us free_ram=102KB usb=1 hid_rpts=120 freezes=0 slack=7600us late=0 cmax=6300us wmax=9100us badfps=0";
+    match TelemetryRecord::parse_line(run_line) {
+        Some(TelemetryRecord::Run(s)) => assert_eq!(s, run_line),
+        other => panic!("Expected TelemetryRecord::Run, got {:?}", other),
+    }
+
+    let aud_line = "[aud] ring=512 prod=48000 drain=48000 underrun=0";
+    match TelemetryRecord::parse_line(aud_line) {
+        Some(TelemetryRecord::Audio(s)) => assert_eq!(s, aud_line),
+        other => panic!("Expected TelemetryRecord::Audio, got {:?}", other),
+    }
+
+    let csg_line = "[csg] writes=1200 voices=3 dropped=0";
+    match TelemetryRecord::parse_line(csg_line) {
+        Some(TelemetryRecord::Csg(s)) => assert_eq!(s, csg_line),
+        other => panic!("Expected TelemetryRecord::Csg, got {:?}", other),
+    }
+
+    let ay_line = "[ay] chips=4 mask=0x0F banks=12 skipped=0";
+    match TelemetryRecord::parse_line(ay_line) {
+        Some(TelemetryRecord::Ay(s)) => assert_eq!(s, ay_line),
+        other => panic!("Expected TelemetryRecord::Ay, got {:?}", other),
+    }
+
+    let orch_line = "[orch] writes=48000 dac_l=128 dac_r=128";
+    match TelemetryRecord::parse_line(orch_line) {
+        Some(TelemetryRecord::Orch(s)) => assert_eq!(s, orch_line),
+        other => panic!("Expected TelemetryRecord::Orch, got {:?}", other),
+    }
+
+    let uac_line = "[uac] pkts=1000 pacing=ok underrun=0";
+    match TelemetryRecord::parse_line(uac_line) {
+        Some(TelemetryRecord::Uac(s)) => assert_eq!(s, uac_line),
+        other => panic!("Expected TelemetryRecord::Uac, got {:?}", other),
+    }
+
+    let settings_line = "[settings] volume = 12";
+    match TelemetryRecord::parse_line(settings_line) {
+        Some(TelemetryRecord::Settings(s)) => assert_eq!(s, settings_line),
+        other => panic!("Expected TelemetryRecord::Settings, got {:?}", other),
+    }
+
+    let other_line = "[custom] diagnostic payload";
+    match TelemetryRecord::parse_line(other_line) {
+        Some(TelemetryRecord::Other(s)) => assert_eq!(s, other_line),
+        other => panic!("Expected TelemetryRecord::Other, got {:?}", other),
+    }
+
+    assert_eq!(TelemetryRecord::parse_line("regular text"), None);
+}
+
+#[test]
+fn test_serial_lines_drain() {
+    use cocozero_rp2350::soc::CoCoZeroSoC;
+    use cocozero_rp2350::spi_sd::MemoryStorage;
+
+    let storage = Box::new(MemoryStorage::new(1024 * 1024));
+    let mut soc = CoCoZeroSoC::new(storage).expect("Init SoC");
+
+    // Initially no serial lines
+    assert!(soc.drain_serial_lines().is_empty());
+
+    // Push bytes into serial_tx_log simulating firmware UART output
+    {
+        let mut log = soc.serial_tx_log.lock().unwrap();
+        log.extend_from_slice(b"[run] fps=60.0\n[aud] ok\npartial");
+    }
+
+    let lines = soc.drain_serial_lines();
+    assert_eq!(lines, vec!["[run] fps=60.0".to_string(), "[aud] ok".to_string()]);
+
+    // Partial remaining in log
+    {
+        let mut log = soc.serial_tx_log.lock().unwrap();
+        log.extend_from_slice(b" completed\n");
+    }
+
+    let lines2 = soc.drain_serial_lines();
+    assert_eq!(lines2, vec!["partial completed".to_string()]);
+}

@@ -6,7 +6,7 @@ use std::time::Instant;
 use cocozero_rp2350::fat32::VirtualFat32Storage;
 use cocozero_rp2350::frontend::Frontend;
 
-use cocozero_rp2350::soc::{CoCoZeroSoC, FB_PIXELS_640};
+use cocozero_rp2350::soc::{CoCoZeroSoC, FB_PIXELS_640, TelemetryRecord};
 use cocozero_rp2350::spi_sd::{FileStorage, MemoryStorage, SectorStorage};
 use cocozero_rp2350::uf2::{FlashImage, parse_uf2};
 
@@ -57,6 +57,10 @@ struct Args {
     /// Override framebuffer SRAM address (e.g. 0x20010000)
     #[arg(long)]
     fb_addr: Option<String>,
+
+    /// Override palette table SRAM address (e.g. 0x20023df0)
+    #[arg(long)]
+    pal_addr: Option<String>,
 
     /// Enqueue ASCII text to be typed into Color BASIC once initialization is complete
     #[arg(long = "type")]
@@ -197,6 +201,17 @@ fn main() {
         }
     }
 
+    if let Some(pal_str) = &args.pal_addr {
+        let clean = pal_str.trim_start_matches("0x").trim_start_matches("0X");
+        if let Ok(addr) = u32::from_str_radix(clean, 16) {
+            println!(
+                "Explicit CLI override: forcing palette address to 0x{:08X}",
+                addr
+            );
+            soc.symbols.pal565_addr = Some(addr);
+        }
+    }
+
     // 5. Initialize Frontend
     let mut frontend = Frontend::new(args.headless).expect("Failed to initialize SDL2 frontend");
     frontend.set_audio_buffer_ms(args.audio_buffer_ms);
@@ -258,6 +273,9 @@ fn main() {
                 }
                 cocozero_rp2350::frontend::JoystickEvent::Fire { port, pressed } => {
                     soc.set_joystick_fire(port, pressed);
+                }
+                cocozero_rp2350::frontend::JoystickEvent::Fire2 { port, pressed } => {
+                    soc.set_joystick_fire2(port, pressed);
                 }
             }
         }
@@ -380,6 +398,11 @@ fn main() {
         // Periodic diagnostic telemetry logging if enabled
         if args.telemetry && frame_count.is_multiple_of(args.telemetry_interval) {
             println!("{}", soc.telemetry());
+            for line in soc.drain_serial_lines() {
+                if let Some(record) = TelemetryRecord::parse_line(&line) {
+                    println!("[serial-telem] {:?}", record);
+                }
+            }
         }
 
         if last_fps_time.elapsed().as_secs() >= 1 {
@@ -424,6 +447,16 @@ fn main() {
     if args.telemetry {
         println!("\n--- Final Diagnostic Telemetry ---");
         println!("{}", soc.telemetry());
+        if let Some(pm) = soc.format_post_mortem() {
+            println!("{}", pm);
+        }
+    }
+
+    // Check for post-mortem diagnostics on abnormal simulation error
+    if had_error {
+        if let Some(pm) = soc.format_post_mortem() {
+            eprintln!("\n{}", pm);
+        }
     }
 
     // Flush any pending SD card sector writes to host storage on exit
